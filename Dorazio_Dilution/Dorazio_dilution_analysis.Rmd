@@ -27,7 +27,6 @@ Set the workding directory and load relevant packages:
 ```{r setup_dir_packages, echo=TRUE, warning=FALSE, message=FALSE}
 
 #set directories and R package library
-setwd("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/Dorazio_Dilution")
 
 library(ggplot2)
 library(ggExtra)
@@ -970,7 +969,7 @@ bayesplot::ppc_intervals(y = log(dil_dat$npositive), yrep = log(la_4$y_new))
 
 # Varying slopes and intercepts for conc groups
 
-```{stan bin_dilution_model_pp_g_o, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_pp_g_slopes"}
+```{stan bin_dilution_model_pp_g_o_2, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_pp_g_slopes"}
 data{
  int<lower=1> N;  // number of observations
  int<lower=1> U; //number unique standard concentrations
@@ -1167,7 +1166,7 @@ bayesplot::ppc_stat( y = dil_dat$npositive ,
 
 #### Compare replicated k to observed k
 
-```{r posterior_predictive_plots_4_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+```{r posterior_predictive_plots_5_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
 bayesplot::ppc_intervals(y = log(dil_dat$npositive), yrep = log(la_5$y_new))
 ```
 
