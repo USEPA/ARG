@@ -1,0 +1,113 @@
+﻿@article{Carpenter_etal_2017,
+   author = {Carpenter, B. and Gelman, A. and Hoffman, M. D. and Lee, D. and Goodrich, B. and Betancourt, M. and Riddell, A. and Guo, J. Q. and Li, P. and Riddell, A.},
+   title = {Stan: A Probabilistic Programming Language},
+   journal = {Journal of Statistical Software},
+   volume = {76},
+   number = {1},
+   pages = {1-29},
+   note = {Ei7tg
+Times Cited:626
+Cited References Count:31},
+   abstract = {Stan is a probabilistic programming language for specifying statistical models. A Stan program imperatively defines a log probability function over parameters conditioned on specified data and constants. As of version 2.14.0, Stan provides full Bayesian inference for continuous-variable models through Markov chain Monte Carlo methods such as the No-U-Turn sampler, an adaptive form of Hamiltonian Monte Carlo sampling. Penalized maximum likelihood estimates are calculated using optimization methods such as the limited memory Broyden-Fletcher-Goldfarb-Shanno algorithm.
+Stan is also a platform for computing log densities and their gradients and Hessians, which can be used in alternative algorithms such as variational Bayes, expectation propagation, and marginal inference using approximate integration. To this end, Stan is set up so that the densities, gradients, and Hessians, along with intermediate quantities of the algorithm such as acceptance probabilities, are easily accessible.
+Stan can be called from the command line using the cmdstan package, through R using the rstan package, and through Python using the pystan package. All three interfaces support sampling and optimization-based inference with diagnostics and posterior analysis. rstan and pystan also provide access to log probabilities, gradients, Hessians, parameter transforms, and specialized plotting.},
+   keywords = {probabilistic program
+bayesian inference
+algorithmic differentiation
+stan
+monte-carlo},
+   ISSN = {1548-7660},
+   DOI = {10.18637/jss.v076.i01},
+   url = {<Go to ISI>://WOS:000392705600001},
+   year = {2017},
+   type = {Journal Article}
+}
+
+@article{Carpenter_etal_2015,
+   author = {Carpenter, Bob and Hoffman, Matthew D. and Brubaker, Marcus and Lee, Daniel and Li, Peter and Betancourt, Michael},
+   title = {The Stan Math Library: Reverse-Mode Automatic Differentiation in C++},
+   journal = {arXiv},
+   volume = {abs/1509.07164},
+   url = {http://arxiv.org/abs/1509.07164},
+   year = {2015},
+   type = {Journal Article}
+}
+
+@article{Dorazio_Hunter_2015,
+   author = {Dorazio, R.M. and M.E. Hunter},
+   title = {Statistical Models for the Analysis and Design of Digital Polymerase
+Chain Reaction (dPCR) Experiments},
+   journal = {Analytical Chemistry},
+   volume = {87},
+   pages = {10886-10893},
+   abstract = {Statistical methods for the analysis and design of
+experiments using digital PCR (dPCR) have received only
+limited attention and have been misused in many instances. To
+address this issue and to provide a more general approach to the
+analysis of dPCR data, we describe a class of statistical models for
+the analysis and design of experiments that require quantification
+of nucleic acids. These models are mathematically equivalent to
+generalized linear models of binomial responses that include a
+complementary, log−log link function and an offset that is
+dependent on the dPCR partition volume. These models are both versatile and easy to fit using conventional statistical software.
+Covariates can be used to specify different sources of variation in nucleic acid concentration, and a model’s parameters can be
+used to quantify the effects of these covariates. For purposes of illustration, we analyzed dPCR data from different types of
+experiments, including serial dilution, evaluation of copy number variation, and quantification of gene expression. We also
+showed how these models can be used to help design dPCR experiments, as in selection of sample sizes needed to achieve
+desired levels of precision in estimates of nucleic acid concentration or to detect differences in concentration among treatments
+with prescribed levels of statistical power.},
+   DOI = {10.1021.acs.analchem.5b02429},
+   url = {https://pubs.acs.org/doi/10.1021/acs.analchem.5b02429},
+   year = {2015},
+   type = {Journal Article}
+}
+
+@article{Stan_Development_Team_2018_c,
+   author = {Team, Stan Development},
+   title = {RStan: the R interface to Stan},
+   url = {http://mc-stan.org},
+   year = {2018},
+   type = {Journal Article}
+}
+
+@article{Stan_Development_Team_2018_b,
+   author = {Team, Stan Development},
+   title = {The Stan Core Library, Version 2.18.0},
+   url = {http://mc-stan.org},
+   year = {2018},
+   type = {Journal Article}
+}
+
+@article{Stan_Development_Team_2018_a,
+   author = {Team, Stan Development},
+   title = {Stan Modeling Language Users Guide and Reference Manual, Version 2.18.0},
+   url = {http://mc-stan.org},
+   year = {2018},
+   type = {Journal Article}
+}
+
+@article{Vehtari_etal_2019,
+   author = {Vehtari, Aki and Gabry, Jonah and Yao, Y. and Gelman, Andrew},
+   title = {loo: Efficient leave-one-out-cross-validation and WAIC for Bayesian models},
+   url = {https://cran.r-project.org/package=loo},
+   year = {2019},
+   type = {Journal Article}
+}
+
+@article{Vehtari_etal_2017,
+   author = {Vehtari, Aki and Gelman, Andrew and Gabry, Jonah},
+   title = {Practical Bayesian model evaluation using leave-one-out cross-validation and WAIC},
+   journal = {Statistics and Computing},
+   volume = {27},
+   number = {5},
+   pages = {1413-1432},
+   abstract = {Leave-one-out cross-validation (LOO) and the widely applicable information criterion (WAIC) are methods for estimating pointwise out-of-sample prediction accuracy from a fitted Bayesian model using the log-likelihood evaluated at the posterior simulations of the parameter values. LOO and WAIC have various advantages over simpler estimates of predictive error such as AIC and DIC but are less used in practice because they involve additional computational steps. Here we lay out fast and stable computations for LOO and WAIC that can be performed using existing simulation draws. We introduce an efficient computation of LOO using Pareto-smoothed importance sampling (PSIS), a new procedure for regularizing importance weights. Although WAIC is asymptotically equal to LOO, we demonstrate that PSIS-LOO is more robust in the finite case with weak priors or influential observations. As a byproduct of our calculations, we also obtain approximate standard errors for estimated predictive errors and for comparison of predictive errors between two models. We implement the computations in an R package called loo and demonstrate using models fit with the Bayesian inference package Stan.},
+   ISSN = {1573-1375},
+   DOI = {10.1007/s11222-016-9696-4},
+   url = {https://doi.org/10.1007/s11222-016-9696-4
+https://link.springer.com/content/pdf/10.1007%2Fs11222-016-9696-4.pdf},
+   year = {2017},
+   type = {Journal Article}
+}
+
+
