@@ -1,0 +1,2297 @@
+---
+title: "NRSA Dilution Study: Modeling and analyses"
+author: "Roy Martin"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  github_document:
+    number_sections: TRUE
+    df_print: paged
+    math_method: 
+      engine: webtex
+    #  url: https://latex.codecogs.com/svg.image?
+    html_preview: TRUE
+    keep_html: TRUE
+editor_options:
+  chunk_output_type: inline
+  markdown: 
+    wrap: 72
+---
+
+# Setup R
+Set the workding directory and load relevant packages:
+```{r setup_dir_packages, echo=TRUE, warning=FALSE, message=FALSE}
+
+#set directories and R package library
+setwd("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/Keely_Dilution/")
+
+library(ggplot2)
+library(ggExtra)
+library(gridExtra)
+library(stringr)
+library(readxl)
+library(tidyverse)
+library(rstan)
+library(loo)
+library(bayesplot)
+library(tidybayes)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# Data
+Import the "cleaned" dilution data.
+```{r import_data, echo=TRUE, warning=FALSE, message=FALSE, cache=TRUE, paged.table=TRUE}
+df_dilution <- read.csv(file = "dil_dat_model.csv", row.names = NULL)
+
+print(df_dilution)
+```
+
+
+Create a data frame with a subset of the columns above that are used just for modeling. Also mutate the "sample" column into a numeric column coding the dilution 
+```{r import_data, echo=TRUE, warning=FALSE, message=FALSE, cache=TRUE, paged.table=TRUE}
+df_model <- df_dilution %>%
+  mutate(dilution = case_when(sample == "Pool2_10000" ~ 10000,
+                         sample == "Pool2_1000" ~ 1000,
+                         sample == "Pool2_100" ~ 100,
+                         sample == "Pool2_10" ~ 10,
+                         sample == "Pool2_5" ~ 5,
+                         sample == "NTC" ~ 0),
+         dilution_p = ifelse(dilution == 0, 0, dilution / 10000)) %>%
+  select(plate, target, dilution, dilution_p, droplets, positives)
+
+print(df_model)
+```
+
+Data are structured such that observations (N = 3392) of positive detections of droplets were nested within targets (L = 323) which were nested within plates (K = 43).
+
+```{r explore_data_1}
+df_model %>%
+  filter(target == "tetA(P)") %>%
+  ggplot(aes(x = dilution_p, y = positives)) + 
+    geom_smooth(method = "lm") + 
+    geom_point()
+```
+
+```{r explore_data_2}
+df_model %>%
+  filter(target == "tetA(P)") %>%
+  ggplot(aes(x = log10(dilution + 1), y = log10(positives + 1))) + 
+    geom_smooth(method = "lm") + 
+    geom_point()
+```
+
+
+```{r explore_data_3}
+df_model %>%
+  #filter(target == "sul2_1") %>%
+  ggplot(aes(x = log(dilution + 1), y = log(positives + 1), group = target, color = target)) + 
+    geom_smooth(method = "lm") + 
+    geom_point() +
+    theme(legend.position="none")
+```
+
+```{r explore_data_4}
+df_model %>%
+  #filter(target == "sul2_1") %>%
+  filter(!is.na(positives),
+         !is.na(droplets)) %>%
+  mutate(prop_pos = positives / droplets,
+         logit_pos = ifelse(positives == 0, -10, log(prop_pos / (1 - prop_pos)))) %>%
+  ggplot(aes(x = log(dilution + 1), y = logit_pos, group = target, color = target)) + 
+    geom_smooth(method = "lm") + 
+    geom_point() +
+    ylab("logit(proportion positive droplets)") +
+    theme(legend.position = "none")
+```
+
+```{r explore_data_5}
+df_model %>%
+  #filter(target == "sul2_1") %>%
+  filter(!is.na(positives),
+         !is.na(droplets)) %>%
+  mutate(prop_pos = positives / droplets,
+         cloglog_pos = ifelse(positives == 0, -8, log(-log(1 - prop_pos)))) %>%
+  ggplot(aes(x = log(dilution + 1), y = cloglog_pos, group = target, color = target)) + 
+    geom_smooth(method = "lm") + 
+    geom_point() +
+    ylab("clog-log(proportion positive droplets)") +
+    theme(legend.position = "none")
+```
+
+# Model 1: no pooling
+First, a model for just one target with no pooled parameters. Starts with a wide uniform prior to better approximate a maximum likelihood estimate.This should result in estimates that are very similar to the Quantasoft estimates in the excel data file.
+```{stan bin_dilution_model_1, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_mod1"}
+data{
+ int <lower=1 > N;  // number of observations
+ int< lower=0 > y[N];  // n success
+ int< lower=1 > k[N];  // k trials
+ vector[N] x1;  // covariate vector
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a[N];  // obs-level mean of success (cloglog)
+ }
+model{
+ //priors
+ target += uniform_lpdf(a | -12 , 12);
+ 
+ //likelihood
+ for(i in 1:N)
+  target += binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a[i]));
+ }
+generated quantities{
+ int y_rep[N];
+ real lambda_rep[N];
+ real total_mol_rep[N];
+ real log_lik[N];
+
+ for(i in 1:N){
+  y_rep[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a[i]));
+  lambda_rep[i] = exp(a[i]);
+  total_mol_rep[i] = lambda_rep[i] * 22;
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a[i]));
+  }
+ }
+```
+
+### Fitting the model to the observed data
+Make a data list for Stan (this list includes variables for subsequent models as well):
+```{r stan_data_1, echo=TRUE, message=FALSE, warning=FALSE}
+df_target <- df_model %>%
+  filter(target == "CowM3")
+
+stan_dataList <- list(N = nrow(df_target),
+                      #A = -0.366,
+                      U = length(unique(df_target$dilution)),
+                      M = length(seq(0, 10000, length.out = 100)/10000),
+                      y = df_target$positives,
+                      k = df_target$droplets,
+                      x1 = log(df_target$dilution + 1),
+                      xNew = log(seq(0, 10000, length.out = 100) + 1),
+                      group = as.numeric(as.factor(df_target$dilution)),
+                      vol_c = rep((0.85/1000), nrow(df_target))
+                      )
+```
+
+Fit the model:
+```{r fit_1, echo=TRUE, cache=TRUE}
+fit_1 <- sampling(object = Bin_dilution_mod1,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  seed = 123
+                  )
+```
+There are a lot of divergent transitions because in this model that shares no information among observations and, therefore, individual observations with 0 positive detections have little information and the posterior estimate will essentially be the prior. Nevertheless, if we ignore the divergencies, this model should provide estimates that are most similar to the Quantasoft estimates.
+
+### Perform LOO
+```{r loo_model_1, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_1 <- loo::extract_log_lik(fit_1, parameter_name= "log_lik", merge_chains = FALSE)
+reff_1 <- loo::relative_eff(exp(log_lik_1),  cores=1)
+loo_1 <- loo::loo(log_lik_1, r_eff = reff_1, cores = 1, save_psis = TRUE)
+print(loo_1)
+plot(loo_1)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_1}
+la_1 <- extract(fit_1)
+wts_1 <- weights(loo_1$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_5, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_pit_ecdf(y = df_target$positives, 
+                    yrep = la_1$y_rep,
+                    lw = wts_1,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_1, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_1, 
+      pars=c("a", "lp__"),
+      digits=4)
+```
+
+#### $\lambda$ parameter
+Estimates of mean concentration (copies / uL) at each dilution point
+```{r summary_lambda_1, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_1,
+      pars="lambda_rep",
+      digits=4)
+```
+Estimates of the total number of molecules, which are indeed very close to the Quantasoft estimates.
+```{r summary_total_mol, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_1,
+      pars="total_mol_rep",
+      digits=4)
+```
+
+### PP Checks
+Posterior predictive checks
+#### Interval coverages for observations
+```{r check_coverage_pp_g_o_5, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(df_target$positives),
+                            yrep = log(la_1$y_rep[sample(1:6000, 200), ]))
+```
+
+#### Replicated min, mean, max, sd
+```{r replicated_checks_pp_g_o_5, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = df_target$positives, 
+                    yrep = la_1$y_rep, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_1$y_rep, 
+                    stat = sd, 
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_1$y_rep, 
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat( y = df_target$positives, 
+                     yrep = la_1$y_rep, 
+                     stat = max,
+                     binwidth = 1)
+```
+
+#### Compare replicated k to observed k
+```{r posterior_predictive_plots_1_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = df_target$positives, yrep = la_1$y_rep, prob_outer = 0.9) +
+  scale_y_continuous(transform = "log10") + 
+  ylab("Count of positives")
+```
+
+The following comparisons are not directly related to assessing model fit. They are only to compare the model estimates to the Quantasoft estimates.
+#### Compare replicated lambda to "observed" lambda (concentration)
+```{r posterior_predictive_plots_1_2, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_1$lambda_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+#### Compare replicated total molecules to "observed"
+```{r posterior_predictive_plots_1_4, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_1$total_mol_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+# Model 2: complete pooling with slope effect
+Second, a model for just one target with completely pooled parameter estimates. Again with relatively wide uniform priors to better approximate a maximum likelihood estimate.
+```{stan bin_dilution_model_2, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_mod2"}
+data{
+ int <lower=1 > N;  // number of observations
+ int< lower=0 > y[N];  // n success
+ int< lower=1 > k[N];  // k trials
+ vector[N] x1;  // covariate vector
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0;  // obs-level mean of success (cloglog)
+ real b1;  // obs-level covariate slope
+ }
+model{
+ //priors
+ target += normal_lpdf(a0 | 0, 2.5);
+ target += normal_lpdf(b1 | 1, 0.25);
+ 
+ //likelihood
+ for(i in 1:N)
+  target += binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i]));
+ }
+generated quantities{
+ int y_rep[N];
+ real lambda_rep[N];
+ real total_mol_rep[N];
+ real log_lik[N];
+
+ for(i in 1:N){
+  y_rep[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i]));
+  lambda_rep[i] = exp(a0 + b1 * x1[i]);
+  total_mol_rep[i] = lambda_rep[i] * 22;
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i]));
+  }
+ }
+```
+
+### Fitting the varying intercepts and slopes model to our data
+
+We fit the model:
+```{r fit_2, echo=TRUE, cache=TRUE}
+fit_2 <- sampling(object = Bin_dilution_mod2,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  seed = 246
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+
+```{r pairs_fit_2, echo=TRUE, warning=FALSE, message=FALSE, fig.asp=1, fig.width=6, fig.align='center'}
+pairs(fit_2, 
+      pars=c("a0", "b1", "lp__"))
+```
+
+### Perform LOO
+```{r loo_model_2, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_2 <- loo::extract_log_lik(fit_2, parameter_name= "log_lik", merge_chains = FALSE)
+reff_2 <- loo::relative_eff(exp(log_lik_2),  cores=1)
+loo_2 <- loo::loo(log_lik_2, r_eff = reff_2, cores = 1, save_psis = TRUE)
+print(loo_2)
+loo_compare(loo_1, loo_2)
+plot(loo_2)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_2}
+la_2 <- extract(fit_2)
+wts_2 <- weights(loo_2$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_52, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_pit_ecdf(y = df_target$positives, 
+                    yrep = la_2$y_rep,
+                    lw = wts_2,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_2, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_2, 
+      pars=c("a0", "b1", "lp__"),
+      digits=4)
+```
+
+#### $\lambda$ parameter
+Estimates of mean concentration (copies / uL) at each dilution point
+```{r summary_lambda_2, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_2,
+      pars="lambda_rep",
+      digits=4)
+```
+
+Estimates of the total number of molecules.
+```{r summary_total_mol_2, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_2,
+      pars="total_mol_rep",
+      digits=4)
+```
+
+### PP Checks
+Posterior predictive checks
+#### Interval coverages for observations
+```{r check_coverage_2, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(df_target$positives),
+                            yrep = log(la_2$y_rep[sample(1:6000, 200), ]))
+```
+
+#### Replicated min, mean, max, sd
+```{r replicated_checks_pp_2, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = df_target$positives, 
+                    yrep = la_2$y_rep, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_2$y_rep, 
+                    stat = sd, 
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_2$y_rep, 
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat( y = df_target$positives, 
+                     yrep = la_2$y_rep, 
+                     stat = max,
+                     binwidth = 10)
+```
+
+#### Compare replicated k to observed k
+```{r posterior_predictive_plots_2_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = df_target$positives, yrep = la_2$y_rep, prob_outer = 0.9) +
+  scale_y_continuous(transform = "log10") + 
+  ylab("Count of positives")
+```
+
+The following comparisons are not directly related to assessing model fit. They are only to compare the model estimates to the Quantasoft estimates.
+
+#### Compare replicated lambda to "observed" lambda (concentration)
+```{r posterior_predictive_plots_2_2, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_2$lambda_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+#### Compare replicated total molecules to "observed"
+```{r posterior_predictive_plots_2_4, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_2$total_mol_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+
+
+# Model 3: varying intercepts for observations (partial pooling)
+Second, a model for just one target, but with varying intercepts for each binomial observation.
+```{stan bin_dilution_model_2, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_mod3"}
+data{
+ int <lower=1 > N;  // number of observations
+ int< lower=0 > y[N];  // n success
+ int< lower=1 > k[N];  // k trials
+ vector[N] x1;  // covariate vector
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0;  // obs-level mean of success (cloglog)
+ real b1;  // obs-level covariate slope
+ vector[N] z_alpha;
+ real<lower=0> sigma_a;
+ }
+transformed parameters{
+ vector[N] alpha = z_alpha * sigma_a;
+}
+model{
+ //priors
+ target += normal_lpdf(a0 | 0, 2.5);
+ target += normal_lpdf(b1 | 1, 0.25);
+ target += normal_lpdf(sigma_a | 0 , 2.5);
+ target += normal_lpdf(z_alpha | 0, 1);
+ 
+ //likelihood
+ for(i in 1:N)
+  target += binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + alpha[i]));
+ }
+generated quantities{
+ real alpha_new[N];
+ int y_rep[N];
+ int y_new[N];
+ real lambda_rep[N];
+ real lambda_new[N];
+ real total_mol_rep[N];
+ real total_mol_new[N];
+ real log_lik[N];
+
+ for(i in 1:N){
+  alpha_new[i] = normal_rng(0, sigma_a);
+  y_rep[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + alpha[i]));
+  y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + alpha_new[i]));
+  lambda_rep[i] = exp(a0 + b1 * x1[i] + alpha[i]);
+  lambda_new[i] = exp(a0 + b1 * x1[i] + alpha_new[i]);
+  total_mol_rep[i] = lambda_rep[i] * 22;
+  total_mol_new[i] = lambda_new[i] * 22;
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + alpha[i]));
+  }
+ }
+```
+
+### Fitting the model
+We fit the model:
+```{r fit_3, echo=TRUE, cache=TRUE}
+fit_3 <- sampling(object = Bin_dilution_mod3,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  seed = 6845
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+```{r pairs_fit_3, echo=TRUE, warning=FALSE, message=FALSE, fig.asp=1, fig.width=6, fig.align='center'}
+pairs(fit_3, 
+      pars=c("a0", "b1", "sigma_a", "lp__"))
+```
+
+### LOO checks
+```{r loo_model_2, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_3 <- loo::extract_log_lik(fit_3, parameter_name= "log_lik", merge_chains = FALSE)
+reff_3 <- loo::relative_eff(exp(log_lik_3),  cores=1)
+loo_3 <- loo::loo(log_lik_3, r_eff = reff_3, cores = 1, save_psis = TRUE)
+print(loo_3)
+loo_compare(loo_1, loo_2, loo_3)
+plot(loo_3)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+```{r extract_model_2}
+la_3 <- extract(fit_3)
+wts_3 <- weights(loo_3$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_5, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_pit_ecdf(y = df_target$positives, 
+                    yrep = la_3$y_rep,
+                    lw = wts_3,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_3, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_3, 
+      pars=c("a0", "b1", "sigma_a", "lp__"),
+      digits=4)
+```
+
+#### $\lambda$ parameter
+Estimates of mean concentration (copies / uL) at each dilution point
+```{r summary_lambda_3, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_3,
+      pars="lambda_rep",
+      digits=4)
+```
+
+Estimates of mean concentration (copies / uL) at each dilution point for a new or past study
+```{r summary_lambda_3, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_3,
+      pars="lambda_new",
+      digits=4)
+```
+
+Estimates of the total number of molecules.
+```{r summary_total_mol_3, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_3,
+      pars="total_mol_rep",
+      digits=4)
+```
+
+Estimates of the total number of molecules for a new study.
+```{r summary_total_mol_3, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_3,
+      pars="total_mol_new",
+      digits=4)
+```
+
+
+### PP Checks
+Posterior predictive checks
+#### Interval coverages for observations
+```{r check_coverage_pp_3, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(df_target$positives),
+                            yrep = log(la_3$y_rep[sample(1:6000, 200), ]))
+```
+
+#### Replicated min, mean, max, sd
+```{r replicated_checks_3, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = df_target$positives, 
+                    yrep = la_3$y_rep, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_3$y_rep, 
+                    stat = sd, 
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_3$y_rep, 
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat( y = df_target$positives, 
+                     yrep = la_3$y_rep, 
+                     stat = max,
+                     binwidth = 10)
+```
+
+#### Compare replicated k to observed k
+```{r posterior_predictive_plots_3_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = df_target$positives, yrep = la_3$y_rep, prob_outer = 0.9) +
+  scale_y_continuous(transform = "log10") + 
+  ylab("Count of positives")
+```
+
+The following comparisons are not directly related to assessing model fit. They are only to compare the model estimates to the Quantasoft estimates.
+#### Compare replicated lambda to "observed" lambda (concentration)
+```{r posterior_predictive_plots_3_2, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_3$lambda_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+```{r posterior_predictive_plots_3_3, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_3$lambda_new), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+#### Compare replicated total molecules to "observed"
+```{r posterior_predictive_plots_3_4, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_3$total_mol_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_3_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_3$total_mol_new), prob_outer = 0.9)  + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+
+# Model 4: varying intercepts for dilution groups (partial pooling)
+```{stan bin_dilution_model_4, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_mod4"}
+data{
+ int <lower=1 > N;  // number of observations
+ int< lower=1 > U; //number unique standard concentrations
+ int< lower=0 > y[N];  // n success
+ int< lower=1 > k[N];  // k trials
+ vector[N] x1;  // covariate vector
+ int<lower=1 , upper=U> group[N]; // Grouping for estimates at U unique standard concns
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0;  // obs-level mean of success (cloglog)
+ real b1;  // obs-level covariate slope
+ vector[U] z_gamma;
+ real< lower=0 > sigma_g;
+ }
+transformed parameters{
+ vector[U] gamma = z_gamma * sigma_g;
+}
+model{
+ //priors
+ target += normal_lpdf(a0 | 0, 2.5);
+ target += normal_lpdf(b1 | 1, 0.25);
+ target += normal_lpdf(sigma_g | 0, 2.5);
+ target += normal_lpdf(z_gamma | 0, 1);
+ 
+ //likelihood
+ for(i in 1:N)
+  target += binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + gamma[group[i]]));
+ }
+generated quantities{
+ real gamma_new[U];
+ int y_rep[N];
+ int y_new[N];
+ real lambda_rep[N];
+ real lambda_new[N];
+ real total_mol_rep[N];
+ real total_mol_new[N];
+ real log_lik[N];
+
+ for(u in 1:U){
+  gamma_new[u] = normal_rng(0, sigma_g);
+  }
+ for(i in 1:N){
+  y_rep[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i]  + gamma[group[i]]));
+  y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i]  + gamma_new[group[i]]));
+  lambda_rep[i] = exp(a0 + b1 * x1[i] + gamma[group[i]]);
+  lambda_new[i] = exp(a0 + b1 * x1[i] + gamma_new[group[i]]);
+  total_mol_rep[i] = lambda_rep[i] * 22;
+  total_mol_new[i] = lambda_new[i] * 22;
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + gamma[group[i]]));
+  }
+ }
+```
+
+
+### Fitting the model
+We fit the model:
+```{r fit_4, echo=TRUE, cache=TRUE}
+fit_4 <- sampling(object = Bin_dilution_mod4,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,,
+                  #control = list(adapt_delta = 0.995, max_treedepth = 14),
+                  seed = 3123
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+```{r pairs_fit_4, echo=TRUE, warning=FALSE, message=FALSE, fig.asp=1, fig.width=6, fig.align='center'}
+pairs(fit_4, 
+      pars=c("a0", "b1", "sigma_g", "lp__"))
+```
+
+### Perform LOO
+```{r loo_model_4, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_4 <- loo::extract_log_lik(fit_4, parameter_name= "log_lik", merge_chains = FALSE)
+reff_4 <- loo::relative_eff(exp(log_lik_4),  cores=1)
+loo_4 <- loo::loo(log_lik_4, r_eff = reff_4, cores = 1, save_psis = TRUE)
+print(loo_4)
+loo_compare(loo_1, loo_2, loo_3, loo_4)
+plot(loo_4)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_4}
+la_4 <- extract(fit_4)
+wts_4 <- weights(loo_4$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_5, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_pit_ecdf(y = df_target$positives, 
+                    yrep = la_4$y_rep,
+                    lw = wts_4,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_4, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_4, 
+      pars=c("a0", "b1", "sigma_g", "lp__"),
+      digits=4)
+```
+
+#### $\lambda$ parameter
+Estimates of mean concentration (copies / uL) at each dilution point
+```{r summary_lambda_4, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_4,
+      pars="lambda_rep",
+      digits=4)
+```
+
+```{r summary_lambda_new_4, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_4,
+      pars="lambda_new",
+      digits=4)
+```
+
+Estimates of the total number of molecules.
+```{r summary_total_mol_4, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_4,
+      pars="total_mol_rep",
+      digits=4)
+```
+
+```{r summary_total_mol_new_4, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_4,
+      pars="total_mol_new",
+      digits=4)
+```
+
+### PP Checks
+Posterior predictive checks
+#### Interval coverages for observations
+```{r check_coverage_pp_4, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(df_target$positives),
+                            yrep = log(la_4$y_rep[sample(1:6000, 200), ]))
+```
+
+#### Replicated min, mean, max, sd
+```{r replicated_checks_4, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = df_target$positives, 
+                    yrep = la_4$y_rep, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_4$y_rep, 
+                    stat = sd, 
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_4$y_rep, 
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat( y = df_target$positives, 
+                     yrep = la_4$y_rep, 
+                     stat = max,
+                     binwidth = 10)
+```
+
+#### Compare replicated k to observed k
+```{r posterior_predictive_plots_4_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = df_target$positives, yrep = la_4$y_rep, prob_outer = 0.9) +
+  scale_y_continuous(transform = "log10") + 
+  ylab("Count of positives")
+```
+
+The following comparisons are not directly related to assessing model fit. They are only to compare the model estimates to the Quantasoft estimates.
+#### Compare replicated lambda to "observed" lambda (concentration)
+```{r posterior_predictive_plots_4_2, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_4$lambda_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+```{r posterior_predictive_plots_4_3, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_4$lambda_new), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+#### Compare replicated total molecules to "observed"
+```{r posterior_predictive_plots_4_4, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_4$total_mol_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_4_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_4$total_mol_new), prob_outer = 0.9)  + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+
+# Model 5: varying intercepts for dilution groups and observations (partial pooling)
+```{stan bin_dilution_model_5, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_mod5"}
+data{
+ int <lower=1 > N;  // number of observations
+ int <lower = 1> M; // number of dilution points to predict to
+ int< lower=1 > U; //number unique standard concentrations
+ int< lower=0 > y[N];  // n success
+ int< lower=1 > k[N];  // k trials
+ vector[N] x1;  // covariate vector
+ vector[M] xNew; // covariate vector for new dilution points
+ int<lower=1 , upper=U> group[N]; // Grouping for estimates at U unique standard concns
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0;  // obs-level mean of success (cloglog)
+ real b1;  // obs-level covariate slope
+ vector[U] z_gamma;
+ real<lower=0> sigma_g;
+ vector[N] z_alpha;
+ real<lower = 0> sigma_a;
+ }
+transformed parameters{
+ vector[U] gamma = z_gamma * sigma_g;
+ vector[N] alpha = z_alpha * sigma_a;
+}
+model{
+ //priors
+ target += normal_lpdf(a0 | 0, 2.5);
+ target += normal_lpdf(b1 | 1, 0.25);
+ target += normal_lpdf(sigma_g | 0, 2.5);
+ target += normal_lpdf(z_gamma | 0, 1);
+ target += normal_lpdf(sigma_a | 0, 2.5);
+ target += normal_lpdf(z_alpha | 0, 1);
+ 
+ //likelihood
+ for(i in 1:N)
+  target += binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + alpha[i] + gamma[group[i]]));
+  }
+generated quantities{
+ real gamma_new[U];
+ real alpha_new[N];
+ int y_rep[N];
+ int y_new[N];
+ real lambda_rep[N];
+ real lambda_new[N];
+ real lambda_pred[M];
+ real total_mol_rep[N];
+ real total_mol_new[N];
+ real total_mol_pred[M];
+ real log_lik[N];
+
+ for(u in 1:U){
+  gamma_new[u] = normal_rng(0, sigma_g);
+  }
+ for(i in 1:N){
+  alpha_new[i] = normal_rng(0, sigma_a);
+  y_rep[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + gamma[group[i]] + alpha[i]));
+  y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + gamma_new[group[i]] + alpha_new[i]));
+  lambda_rep[i] = exp(a0 + b1 * x1[i] + gamma[group[i]] + alpha[i]);
+  lambda_new[i] = exp(a0 + b1 * x1[i] + gamma_new[group[i]] + alpha_new[i]);
+  total_mol_rep[i] = lambda_rep[i] * 22;
+  total_mol_new[i] = lambda_new[i] * 22;
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + gamma[group[i]] + alpha[i]));
+  }
+ for(r in 1:M){
+  lambda_pred[r] = exp(a0 + b1 * xNew[r] + normal_rng(0, sigma_g) + normal_rng(0, sigma_a)); 
+  //+ std_normal_rng() * (a0 + b1 * xNew[r] * (inv_logit((xNew[r] - c) * z)) ^ (2.0 * alpha)) * (sigma ^ 2.0));
+  total_mol_pred[r] = lambda_pred[r] * 22;
+  }
+ }
+```
+
+### Fitting the varying intercepts and slopes model to our data
+We fit the model:
+```{r fit_4, echo=TRUE, cache=TRUE}
+fit_5 <- sampling(object = Bin_dilution_mod5,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  #control = list(adapt_delta = 0.995, max_treedepth = 12),
+                  seed = 4351
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+```{r pairs_fit_5, echo=TRUE, warning=FALSE, message=FALSE, fig.asp=1, fig.width=6, fig.align='center'}
+pairs(fit_5, pars=c("a0", "b1", "sigma_g", "sigma_a", "lp__"))
+```
+
+### Perform LOO
+```{r loo_model_5, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_5 <- loo::extract_log_lik(fit_5, parameter_name= "log_lik", merge_chains = FALSE)
+reff_5 <- loo::relative_eff(exp(log_lik_5),  cores=1)
+loo_5 <- loo::loo(log_lik_5, r_eff = reff_5, cores = 1, save_psis = TRUE)
+print(loo_5)
+loo_compare(loo_1, loo_2, loo_3, loo_4, loo_5)
+plot(loo_5)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_5}
+la_5 <- extract(fit_5)
+wts_5 <- weights(loo_5$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_5, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_pit_ecdf(y = df_target$positives, 
+                    yrep = la_5$y_rep,
+                    lw = wts_5,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_5, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_5, 
+      pars=c("a0", "b1", "sigma_g", "sigma_a", "lp__"),
+      digits=4)
+```
+
+#### $\lambda$ parameter
+Estimates of mean concentration (copies / uL) at each dilution point
+```{r summary_lambda_5, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_5,
+      pars="lambda_rep",
+      digits=4)
+```
+
+```{r summary_lambda_new_5, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_5,
+      pars="lambda_new",
+      digits=4)
+```
+
+Estimates of the total number of molecules.
+```{r summary_total_mol_5, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_5,
+      pars="total_mol_rep",
+      digits=4)
+```
+
+```{r summary_total_mol_new_5, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_5,
+      pars="total_mol_new",
+      digits=4)
+```
+
+### PP Checks
+Posterior predictive checks
+#### Interval coverages for observations
+```{r check_coverage_pp_5, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(df_target$positives),
+                            yrep = log(la_5$y_rep[sample(1:6000, 200), ]))
+```
+
+#### Replicated min, mean, max, sd
+```{r replicated_checks_5, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = df_target$positives, 
+                    yrep = la_5$y_rep, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_5$y_rep, 
+                    stat = sd, 
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_5$y_rep, 
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat( y = df_target$positives, 
+                     yrep = la_5$y_rep, 
+                     stat = max,
+                     binwidth = 10)
+```
+
+#### Compare replicated k to observed k
+```{r posterior_predictive_plots_5_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = df_target$positives, yrep = la_5$y_rep, prob_outer = 0.9) +
+  scale_y_continuous(transform = "log10") + 
+  ylab("Count of positives")
+```
+
+The following comparisons are not directly related to assessing model fit. They are only to compare the model estimates to the Quantasoft estimates.
+#### Compare replicated lambda to "observed" lambda (concentration)
+```{r posterior_predictive_plots_5_2, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_5$lambda_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+```{r posterior_predictive_plots_5_3, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_5$lambda_new), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+#### Compare replicated total molecules to "observed"
+```{r posterior_predictive_plots_5_4, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_5$total_mol_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_5_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_5$total_mol_new), prob_outer = 0.9)  + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_5_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+plot_dat <- data.frame(x =  df_target$dilution_p,
+                       mols= df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn)
+
+data.frame(x = (exp(stan_dataList$xNew) - 1)/10000) %>%
+  add_draws(la_5$total_mol_pred) %>%
+  ggplot(aes(x = x, y = .value)) +
+  stat_lineribbon(alpha = 1/4) +
+  geom_point(aes(x = x, 
+                  y = mols),
+             data = plot_dat,
+             color = 'red') +
+  #scale_x_continuous(transform = "log10") +
+  scale_y_continuous(transform = "log10") +
+  #xlim(0, 0.01) +
+  #ylim(0, 10000) +
+  theme_bw() +
+  xlab("Dilution") +
+  ylab("Predicted total molecules")
+   
+  # probability total molecules > x
+  plot(colSums(ifelse(la_5$total_mol_pred >= 10000, 1, 0))/6000 ~ stan_dataList$xNew, typ = 'l', ylab = "Probaility > 10,000 molecules", xlab = "dilution")
+```
+
+
+# Model 6: Changepoint model
+$$ \text{E}[y | x, \beta] = g(x, \beta) = \beta_1 + \frac{\beta_2}{1 + (x/\beta_3)^{-\beta_4}} $$
+The model is a scaled and shifted logistic curve. This structure results in the following interpretations for $\beta$, all of which are restricted to positive values:
+
+$\beta_1$: color intensity when the concentration is 0
+$\beta_2$: increase to saturation
+$\beta_3$: the inflection point of the curve
+$\beta_4$: rate of saturation
+
+Below are the prior distributions for $\beta$. Note that they are are drastically different scales - this is critical to help the model fit the data.
+
+$$ \beta_1 \sim N(10, 2.5) \text{, } \beta_2 \sim N(100, 5) \text{, } \beta_3 \sim N(0, 1) \text{, } \beta_4 \sim N(0, 2.5) $$
+
+The measurement error of the model, representing the variance in the model’s likelihood is defined as follows:
+
+$$ \tau(\alpha, \sigma_y, g(x, \beta), A) = \lgroup \frac{g(x,\beta)}{A} \rgroup^{2\alpha} \sigma^2_y $$
+
+Here, $\alpha$, restricted to lie between 0 and 1, allows the variance to be higher for larger measurement values. $A$ is a constant (set to 30 by Gelman et al. 2004) that allows $\sigma_y$ to be more easily interpreted as the variance from “typical” measurements. Below are the priors for the new variables in the model.
+
+$$ \alpha \sim \text{Beta}(1, 1) \qquad \sigma \sim |N(0, 2.5)| $$
+
+Simulate from the model Higgins et al. (1988).
+```{r simulate_observations_1}
+# cloglog
+a0 <- -2.5 # count at zero concentration
+b1 <- 17 # increase to saturation
+b2 <- 0.2 # concentration at which curve turns
+b3 <- 0.25 # rate of saturation
+
+dil <- df_target$dilution / 10000
+# x <- seq(0, 10000, length.out = 100)/10000
+# linpred <- 1 - exp(-exp(log(0.85/1000) + a0 + (b1 / (1 + (dil / b2) ^ -b3))))
+
+linpred_cloglog <- 1 - exp(-exp(log(0.85/1000) + a0 + (b1 / (1 + (dil / b2) ^ -b3))))
+lambda_cloglog <- exp(a0 + (b1 / (1 + (dil / b2) ^ -b3)))
+
+
+tibble(dil_data = df_target$dilution, 
+       dil_scaled = dil, 
+       pos = df_target$positives, 
+       n = df_target$droplets, 
+       npos_cloglog =  linpred_cloglog * n, 
+       lambda_cloglog = lambda_cloglog)
+```
+
+```{r simulate_observations_2}
+# All parameters must be positive
+set.seed(10)
+z <- 10 # abruptness of the change
+c <- 1 # change point
+a0 <- -2.5 # y-intercept
+b1 <- 0.5 # slope 1
+b2 <- 1 # slope 2
+#A <- -0.366 # -0.366 = prob = 0.5
+alpha <- 0 # number between 0 and 2, where 0 is equal var, 1 is equal on log scale
+sigma <- 0.05 # meas error
+
+# because of precedence of operations r, we need to make a new function for exponentiating a vector
+# see stackoverflow
+exponent <- function(a, pow) (abs(a) ^ pow) * sign(a)
+# make and inverse-logit function
+inv_logit_scaled <- function(x, lb = 0, ub = 1) exp(x) / (1 + exp(x)) * (ub - lb) + lb
+
+dil <- log(df_target$dilution + 1)
+
+g <- a0 + b1 * dil * (inv_logit_scaled((dil - c) * z)) + b2 * dil * (inv_logit_scaled((dil - c) * z))
+#eps_z <- rnorm(length(dil), 0, 1)
+#eps <- eps_z * exponent(g, 2 * alpha) * (sigma ^ 2)
+linpred_cloglog <- 1 - exp(-exp(log(0.85 / 1000) + g))
+npos <- rbinom(rep(1, nrow(df_target)), size = df_target$droplets, prob = linpred_cloglog)
+lam <- exp(g + eps)
+
+tibble(dil_data = df_target$dilution, 
+       dil = dil, 
+       pos = df_target$positives, 
+       conc = df_dilution[which(df_dilution$target == "Enterobacter(Patel)"),]$conc,
+       n = df_target$droplets, 
+       npos_cloglog =  npos, 
+       lambda_cloglog = round(lam, 1))
+```
+
+Plot simulation:
+```{r simulate_observations_1}
+tibble(dil_data = df_target$dilution, 
+       dil = dil, 
+       pos = df_target$positives, 
+       conc = df_dilution[which(df_dilution$target == "CowM3"),]$conc,
+       n = df_target$droplets, 
+       npos_cloglog =  npos, 
+       lambda_cloglog = round(lam, 1)) %>%
+  ggplot(aes(x = dil, y = log(pos + 1))) +
+    #scale_x_continuous(transform = "log10") +
+    #scale_y_continuous(transform = "log10") +
+    geom_point() +
+    geom_jitter(aes(x = dil, y = log(npos + 1)), colour = "red", width = 0.1) +
+    geom_smooth(method = "lm") +
+    xlab("Dilution (proportion of starting conc)") +
+    ylab("log of positives")
+```
+
+cloglog(p) roughly -15 to 2.5, with median -0.367 (prob approx 0.5)
+```{stan bin_dilution_model_6, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_mod6"}
+data{
+ int <lower=1> N; // number of observations
+ int <lower = 1> M; // number of new observations for prediction
+ int<lower=0> y[N]; // n success
+ int<lower=1> k[N]; // k trials
+ vector[N] x1; // covariate vector
+ vector[M] xNew; // dilution vector to predict to
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0;
+ real<lower = 0> b1;
+ real c;
+ real<lower = 0> sigma;
+ vector[N] z_eps;
+ }
+transformed parameters{
+ vector[N] g;
+ vector[N] eps;
+ 
+ for(i in 1:N){
+   eps[i] = z_eps[i] * sigma;
+   g[i] = a0 + b1 * x1[i] * (inv_logit((x1[i] - c) * 5)) + eps[i];
+   }
+}
+model{
+ //priors
+ target += normal_lpdf(a0 | -3.5, 3);
+ target += gamma_lpdf(b1 | 2.5, 3.5);
+ target += normal_lpdf(c | 0, 5);
+ target += normal_lpdf(sigma | 0, 2.5);
+ target += normal_lpdf(z_eps | 0, 1);
+ 
+ //likelihood
+ for(i in 1:N)
+   target += binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps[i]));
+   }
+generated quantities{
+ vector[N] eps_new;
+ vector[M] eps_pred;
+ int y_rep[N];
+ int y_new[N];
+ real lambda_rep[N];
+ real lambda_new[N];
+ real lambda_pred[M];
+ real total_mol_rep[N];
+ real total_mol_new[N];
+ real total_mol_pred[M];
+ real log_lik[N];
+
+ for(i in 1:N){
+  eps_new[i] = normal_rng(0, sigma);
+  y_rep[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps[i]));
+  y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps_new[i])); 
+  //std_normal_rng() * (g[i] ^ (2.0 * alpha)) * (sigma ^ 2.0)));
+  lambda_rep[i] = exp(g[i] + eps[i]);
+  lambda_new[i] = exp(g[i] + eps_new[i]);
+  //std_normal_rng() * (g[i] ^ (2.0 * alpha)) * (sigma ^ 2.0));
+  total_mol_rep[i] = lambda_rep[i] * 22;
+  total_mol_new[i] = lambda_new[i] * 22;
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps[i]));
+  }
+ for(r in 1:M){
+  eps_pred[r] = normal_rng(0, sigma);
+  lambda_pred[r] = exp(a0 + b1 * xNew[r] * (inv_logit((xNew[r] - c) * 5)) + eps_pred[r]); 
+  //+ std_normal_rng() * (a0 + b1 * xNew[r] * (inv_logit((xNew[r] - c) * z)) ^ (2.0 * alpha)) * (sigma ^ 2.0));
+  total_mol_pred[r] = lambda_pred[r] * 22;
+  }
+ }
+```
+
+
+### Fitting the model
+We fit the model:
+```{r fit_6, echo=TRUE, cache=TRUE}
+fit_6 <- sampling(object = Bin_dilution_mod6,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  #control = list(adapt_delta = 0.985, max_treedepth = 14),
+                  seed = 4851
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+```{r pairs_fit_6, echo=TRUE, warning=FALSE, message=FALSE, fig.asp=1, fig.width=6, fig.align='center'}
+pairs(fit_6, pars=c("a0", "b1", "c", "sigma", "lp__"))
+```
+
+### Perform LOO
+```{r loo_model_6, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_6 <- loo::extract_log_lik(fit_6, parameter_name= "log_lik", merge_chains = FALSE)
+reff_6 <- loo::relative_eff(exp(log_lik_6),  cores = 1)
+loo_6 <- loo::loo(log_lik_6, r_eff = reff_6, cores = 1, save_psis = TRUE)
+print(loo_6)
+loo_compare(loo_1, loo_2, loo_3, loo_4, loo_5, loo_6)
+plot(loo_6)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_6}
+la_6 <- extract(fit_6)
+wts_6 <- weights(loo_6$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_6, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_pit_ecdf(y = df_target$positives, 
+                    yrep = la_6$y_rep,
+                    lw = wts_6,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_6, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_6, 
+      pars=c("a0", "b1", "c", "sigma", "lp__"),
+      digits=4)
+```
+
+#### $\lambda$ parameter
+Estimates of mean concentration (copies / uL) at each dilution point
+```{r summary_lambda_6, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_6,
+      pars="lambda_rep",
+      digits=4)
+```
+
+```{r summary_lambda_new_6, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_6,
+      pars="lambda_new",
+      digits=4)
+```
+
+Estimates of the total number of molecules.
+```{r summary_total_mol_6, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_6,
+      pars="total_mol_rep",
+      digits=4)
+```
+
+```{r summary_total_mol_new_6, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_6,
+      pars="total_mol_new",
+      digits=4)
+```
+
+### PP Checks
+Posterior predictive checks
+#### Interval coverages for observations
+```{r check_coverage_pp_6, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(df_target$positives),
+                            yrep = log(la_6$y_rep[sample(1:6000, 200), ]))
+```
+
+#### Replicated min, mean, max, sd
+```{r replicated_checks_6, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = df_target$positives, 
+                    yrep = la_6$y_rep, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_6$y_rep, 
+                    stat = sd, 
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_6$y_rep, 
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat( y = df_target$positives, 
+                     yrep = la_6$y_rep, 
+                     stat = max,
+                     binwidth = 10)
+```
+
+#### Compare replicated k to observed k
+```{r posterior_predictive_plots_6_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = df_target$positives, yrep = la_6$y_rep, prob_outer = 0.9) +
+  scale_y_continuous(transform = "log") + 
+  ylab("Count of positives")
+```
+
+The following comparisons are not directly related to assessing model fit. They are only to compare the model estimates to the Quantasoft estimates.
+#### Compare replicated lambda to "observed" lambda (concentration)
+```{r posterior_predictive_plots_6_2, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_6$lambda_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+```{r posterior_predictive_plots_6_3, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_6$lambda_new), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+#### Compare replicated total molecules to "observed"
+```{r posterior_predictive_plots_5_4, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_6$total_mol_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_5_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_6$total_mol_new), prob_outer = 0.9)  + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_5_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+plot_dat <- data.frame(x =  df_target$dilution_p,
+                       mols= df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn)
+
+data.frame(x = (exp(stan_dataList$xNew)-1)/10000) %>%
+  add_draws(la_6$total_mol_pred) %>%
+  ggplot(aes(x = x, y = .value)) +
+  stat_lineribbon(alpha = 1/4) +
+  geom_point(aes(x = x, 
+                  y = mols),
+             data = plot_dat,
+             color = 'red') +
+  #scale_x_continuous(transform = "log10") +
+  #scale_y_continuous(transform = "log10") +
+  #xlim(0, 0.025) +
+  #ylim(0, 1000) +
+  theme_bw() +
+  xlab("Dilution") +
+  ylab("Predicted total molecules")
+   
+  # probability total molecules > x
+  plot(colSums(ifelse(la_6$total_mol_pred >= 10000, 1, 0))/6000 ~ stan_dataList$xNew, typ = 'l', ylab = "Probaility > 10,000 molecules", xlab = "dilution")
+```
+
+
+# Model 7: Gelman et al (2004) model
+$$ \text{E}[y | x, \beta] = g(x, \beta) = \beta_1 + \frac{\beta_2}{1 + (x/\beta_3)^{-\beta_4}} $$
+The model is a scaled and shifted logistic curve. This structure results in the following interpretations for $\beta$, all of which are restricted to positive values:
+
+$\beta_1$: color intensity when the concentration is 0
+$\beta_2$: increase to saturation
+$\beta_3$: the inflection point of the curve
+$\beta_4$: rate of saturation
+
+Below are the prior distributions for $\beta$. Note that they are are drastically different scales - this is critical to help the model fit the data.
+
+$$ \beta_1 \sim N(10, 2.5) \text{, } \beta_2 \sim N(100, 5) \text{, } \beta_3 \sim N(0, 1) \text{, } \beta_4 \sim N(0, 2.5) $$
+
+The measurement error of the model, representing the variance in the model’s likelihood is defined as follows:
+
+$$ \tau(\alpha, \sigma_y, g(x, \beta), A) = \lgroup \frac{g(x,\beta)}{A} \rgroup^{2\alpha} \sigma^2_y $$
+
+Here, $\alpha$, restricted to lie between 0 and 1, allows the variance to be higher for larger measurement values. $A$ is a constant (set to 30 by Gelman et al. 2004) that allows $\sigma_y$ to be more easily interpreted as the variance from “typical” measurements. Below are the priors for the new variables in the model.
+
+$$ \alpha \sim \text{Beta}(1, 1) \qquad \sigma \sim |N(0, 2.5)| $$
+
+Simulate from the model Higgins et al. (1988).
+```{r simulate_observations_1}
+# cloglog
+a0 <- -3.5 # count at zero concentration
+b1 <- 18.4 # increase to saturation
+b2 <- 0.17 # concentration at which curve turns
+b3 <- 0.23 # rate of saturation
+sigma <- 0.023
+
+dil <- df_target$dilution_p # log(df_target$dilution + 1)
+# x <- seq(0, 10000, length.out = 100)/10000
+
+g <- a0 + (b1 / (1 + (dil / b2) ^ -b3))
+eps_z <- rnorm(length(dil), 0, 1)
+eps <- sigma * eps_z #exponent(g / -0.37 , (2 * sigma)) * eps_z
+
+linpred_cloglog <- 1 - exp(-exp(log(0.85 / 1000) + g + eps))
+hat_pos <- rbinom(rep(1, nrow(df_target)), size = df_target$droplets, prob = linpred_cloglog)
+lam <- exp(g + eps)
+
+tibble(dil_data = df_target$dilution, 
+       dil_scaled = dil, 
+       pos = df_target$positives, 
+       n = df_target$droplets, 
+       hat_pos =  hat_pos, 
+       lambda = round(lam, 2))
+```
+
+Plot simulation:
+```{r simulate_observations_2}
+tibble(dil = dil, 
+       pos = df_target$positives, 
+       conc = df_dilution[which(df_dilution$target == "CowM3"),]$conc,
+       n = df_target$droplets, 
+       hat_pos =  hat_pos, 
+       lambda = round(lam, 1)) %>%
+  ggplot(aes(x = dil, y = hat_pos)) +
+    geom_point() +
+    geom_jitter(aes(x = dil, y = pos), colour = "red", width = 0.01) +
+    #geom_smooth(method = "lm") +
+    scale_x_continuous(transform = "log10") +
+    scale_y_continuous(transform = "log10") +
+    xlab("log10 dilution (proportion of starting conc)") +
+    ylab("log10 of positives")
+```
+
+cloglog(p) roughly -15 to 2.5, with -0.367 approx prob = 0.5
+```{stan bin_dilution_model_7, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_mod7"}
+data{
+ int <lower=1> N; // number of observations
+ int <lower = 1> M; // number of new observations for prediction
+ int<lower=0> y[N]; // n success
+ int<lower=1> k[N]; // k trials
+ vector[N] x1; // covariate vector
+ vector[M] xNew; // dilution vector to predict to
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0;
+ vector<lower = 0>[3] beta;
+ real<lower = 0> sigma;
+ vector[N] z_eps;
+ }
+transformed parameters{
+ vector[N] g = a0 + (beta[1] / (1 + (x1 / beta[2]) ^ -beta[3]));
+ vector[N] eps = z_eps * sigma;
+ }
+model{
+ //priors
+ target += normal_lpdf(a0 | -2, 3);
+ target += normal_lpdf(beta[1] | 10, 5);
+ target += normal_lpdf(beta[2] | 0, 1);
+ target += normal_lpdf(beta[3] | 0, 2.5);
+ target += normal_lpdf(sigma | 0, 2.5);
+ target += normal_lpdf(z_eps | 0, 1);
+ 
+ //likelihood
+   target += binomial_lpmf(y | k, inv_cloglog(log(vol_c) + g + eps));
+   }
+generated quantities{
+ vector[N] eps_new;
+ vector[M] eps_pred;
+ int y_rep[N];
+ int y_new[N];
+ real lambda_rep[N];
+ real lambda_new[N];
+ real lambda_pred[M];
+ real total_mol_rep[N];
+ real total_mol_new[N];
+ real total_mol_pred[M];
+ real log_lik[N];
+
+ for(i in 1:N){
+  eps_new[i] = normal_rng(0, sigma);
+  y_rep[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps[i]));
+  y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps_new[i])); 
+  //std_normal_rng() * (g[i] ^ (2.0 * alpha)) * (sigma ^ 2.0)));
+  lambda_rep[i] = exp(g[i] + eps[i]);
+  lambda_new[i] = exp(g[i] + eps_new[i]);
+  //std_normal_rng() * (g[i] ^ (2.0 * alpha)) * (sigma ^ 2.0));
+  total_mol_rep[i] = lambda_rep[i] * 22;
+  total_mol_new[i] = lambda_new[i] * 22;
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps[i]));
+  }
+ for(r in 1:M){
+  eps_pred[r] = normal_rng(0, sigma);
+  lambda_pred[r] = exp(a0 + (beta[1] / (1 + (xNew[r] / beta[2]) ^ -beta[3])) + eps_pred[r]); 
+  //+ std_normal_rng() * (a0 + b1 * xNew[r] * (inv_logit((xNew[r] - c) * z)) ^ (2.0 * alpha)) * (sigma ^ 2.0));
+  total_mol_pred[r] = lambda_pred[r] * 22;
+  }
+ }
+```
+
+
+### Fitting the model
+We fit the model:
+```{r fit_7, echo=TRUE, cache=TRUE}
+stan_dataList$x1 <- df_target$dilution / 10000
+stan_dataList$xNew <- seq(0, 10000, length.out = 100) / 10000
+
+fit_7 <- sampling(object = Bin_dilution_mod7,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  control = list(adapt_delta = 0.9, max_treedepth = 12),
+                  seed = 254
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+```{r pairs_fit_7, echo=TRUE, warning=FALSE, message=FALSE, fig.asp=1, fig.width=6, fig.align='center'}
+pairs(fit_7, pars=c("a0", "beta", "sigma", "lp__"))
+```
+
+### Perform LOO
+```{r loo_model_7, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_7 <- loo::extract_log_lik(fit_7, parameter_name= "log_lik", merge_chains = FALSE)
+reff_7 <- loo::relative_eff(exp(log_lik_7),  cores = 1)
+loo_7 <- loo::loo(log_lik_7, r_eff = reff_7, cores = 1, save_psis = TRUE)
+print(loo_7)
+loo_compare(loo_1, loo_2, loo_3, loo_4, loo_5, loo_6, loo_7)
+plot(loo_7)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_7}
+la_7 <- extract(fit_7)
+wts_7 <- weights(loo_7$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_7, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_pit_ecdf(y = df_target$positives, 
+                    yrep = la_7$y_rep,
+                    lw = wts_7,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_7, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_7, 
+      pars=c("a0", "beta", "sigma", "lp__"),
+      digits=4)
+```
+
+#### $\lambda$ parameter
+Estimates of mean concentration (copies / uL) at each dilution point
+```{r summary_lambda_7, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_7,
+      pars="lambda_rep",
+      digits=4)
+```
+
+```{r summary_lambda_new_7, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_7,
+      pars="lambda_new",
+      digits=4)
+```
+
+Estimates of the total number of molecules.
+```{r summary_total_mol_7, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_7,
+      pars="total_mol_rep",
+      digits=4)
+```
+
+```{r summary_total_mol_new_7, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_7,
+      pars="total_mol_new",
+      digits=4)
+```
+
+### PP Checks
+Posterior predictive checks
+#### Interval coverages for observations
+```{r check_coverage_pp_7, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(df_target$positives),
+                            yrep = log(la_7$y_rep[sample(1:6000, 200), ]))
+```
+
+#### Replicated min, mean, max, sd
+```{r replicated_checks_7, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = df_target$positives, 
+                    yrep = la_7$y_rep, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_7$y_rep, 
+                    stat = sd, 
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_7$y_rep, 
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat( y = df_target$positives, 
+                     yrep = la_7$y_rep, 
+                     stat = max,
+                     binwidth = 10)
+```
+
+#### Compare replicated k to observed k
+```{r posterior_predictive_plots_7_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = df_target$positives, yrep = la_7$y_rep, prob_outer = 0.9) +
+  scale_y_continuous(transform = "log10") + 
+  ylab("Count of positives")
+```
+
+The following comparisons are not directly related to assessing model fit. They are only to compare the model estimates to the Quantasoft estimates.
+#### Compare replicated lambda to "observed" lambda (concentration)
+```{r posterior_predictive_plots_7_2, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_7$lambda_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+```{r posterior_predictive_plots_7_3, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_7$lambda_new), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+#### Compare replicated total molecules to "observed"
+```{r posterior_predictive_plots_7_4, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_7$total_mol_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_7_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_7$total_mol_new), prob_outer = 0.9)  + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_7_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+plot_dat <- data.frame(x =  df_target$dilution_p,
+                       mols= df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn)
+
+data.frame(x = stan_dataList$xNew) %>%
+  add_draws(la_7$total_mol_pred) %>%
+  ggplot(aes(x = x, y = .value)) +
+  stat_lineribbon(alpha = 1/4) +
+  geom_point(aes(x = x, 
+                  y = mols),
+             data = plot_dat,
+             color = 'red') +
+  scale_x_continuous(transform = "log10") +
+  scale_y_continuous(transform = "log10") +
+  #xlim(0, 0.01) +
+  #ylim(0, 10000) +
+  theme_bw() +
+  xlab("log10 Dilution") +
+  ylab("log10 Predicted total molecules")
+   
+  # probability total molecules > x
+  plot(colSums(ifelse(la_7$total_mol_pred >= 10000, 1, 0))/6000 ~ stan_dataList$xNew, typ = 'l', ylab = "Probaility > 10,000 molecules", xlab = "dilution")
+```
+
+
+# Model 8: Changepoint model 2
+cloglog(p) roughly -15 to 2.5, with median -0.367 (prob approx 0.5)
+```{stan bin_dilution_model_6, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_mod8"}
+data{
+ int <lower=1> N; // number of observations
+ int< lower=1 > U; //number unique standard concentrations
+ int <lower = 1> M; // number of new observations for prediction
+ int<lower=0> y[N]; // n success
+ int<lower=1> k[N]; // k trials
+ vector[N] x1; // covariate vector
+ vector[M] xNew; // dilution vector to predict to
+ int <lower = 1> group[N]; // dilution grouping
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0;
+ real<lower = 0> b1;
+ real c;
+ vector<lower = 0> [2] sigma;
+ vector[N] z_eps;
+ vector[U] z_nu;
+ }
+transformed parameters{
+ vector[N] g;
+ vector[N] eps = z_eps * sigma[1];
+ vector[U] nu = z_nu * sigma[2];
+ 
+ for(i in 1:N){
+   g[i] = a0 + b1 * x1[i] * (inv_logit((x1[i] - c) * 5)) + eps[i] + nu[group[i]];
+   }
+
+}
+model{
+ //priors
+ target += normal_lpdf(a0 | -3.5, 3);
+ target += gamma_lpdf(b1 | 2.5, 3.5);
+ target += normal_lpdf(c | 0, 5);
+ target += normal_lpdf(sigma | 0, 2.5);
+ target += normal_lpdf(z_eps | 0, 1);
+ target += normal_lpdf(z_nu | 0, 1);
+ 
+ //likelihood
+ for(i in 1:N)
+   target += binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps[i] + nu[group[i]]));
+   }
+generated quantities{
+ vector[N] eps_new;
+ vector[U] nu_new;
+ int y_rep[N];
+ int y_new[N];
+ real lambda_rep[N];
+ real lambda_new[N];
+ real lambda_pred[M];
+ real total_mol_rep[N];
+ real total_mol_new[N];
+ real total_mol_pred[M];
+ real log_lik[N];
+ 
+ for(u in 1:U){
+  nu_new[u] = normal_rng(0, sigma[2]);
+  }
+ for(i in 1:N){
+  eps_new[i] = normal_rng(0, sigma[1]);
+  y_rep[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps[i] + nu[group[i]]));
+  y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps_new[i] + nu_new[group[i]])); 
+  //std_normal_rng() * (g[i] ^ (2.0 * alpha)) * (sigma ^ 2.0)));
+  lambda_rep[i] = exp(g[i] + eps[i] + nu[group[i]]);
+  lambda_new[i] = exp(g[i] + eps_new[i] + nu_new[group[i]]);
+  //std_normal_rng() * (g[i] ^ (2.0 * alpha)) * (sigma ^ 2.0));
+  total_mol_rep[i] = lambda_rep[i] * 22;
+  total_mol_new[i] = lambda_new[i] * 22;
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps[i] + nu[group[i]]));
+  }
+ for(r in 1:M){
+  lambda_pred[r] = exp(a0 + b1 * xNew[r] * (inv_logit((xNew[r] - c) * 5)) + normal_rng(0, sigma[1]) + normal_rng(0, sigma[2])); 
+  //+ std_normal_rng() * (a0 + b1 * xNew[r] * (inv_logit((xNew[r] - c) * z)) ^ (2.0 * alpha)) * (sigma ^ 2.0));
+  total_mol_pred[r] = lambda_pred[r] * 22;
+  }
+ }
+```
+
+
+### Fitting the model
+We fit the model:
+```{r fit_8, echo=TRUE, cache=TRUE}
+fit_8 <- sampling(object = Bin_dilution_mod8,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  #control = list(adapt_delta = 0.99, max_treedepth = 14),
+                  seed = 4851
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+```{r pairs_fit_8, echo=TRUE, warning=FALSE, message=FALSE, fig.asp=1, fig.width=6, fig.align='center'}
+pairs(fit_8, pars=c("a0", "b1", "c", "sigma", "lp__"))
+```
+
+### Perform LOO
+```{r loo_model_8, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_8 <- loo::extract_log_lik(fit_8, parameter_name= "log_lik", merge_chains = FALSE)
+reff_8 <- loo::relative_eff(exp(log_lik_8),  cores = 1)
+loo_8 <- loo::loo(log_lik_8, r_eff = reff_6, cores = 1, save_psis = TRUE)
+print(loo_8)
+loo_compare(loo_1, loo_2, loo_3, loo_4, loo_5, loo_6, loo_7, loo_8)
+plot(loo_8)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_8}
+la_8 <- extract(fit_8)
+wts_8 <- weights(loo_8$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_8, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_pit_ecdf(y = df_target$positives, 
+                    yrep = la_8$y_rep,
+                    lw = wts_8,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_8, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_8, 
+      pars=c("a0", "b1", "c", "sigma", "lp__"),
+      digits=4)
+```
+
+#### $\lambda$ parameter
+Estimates of mean concentration (copies / uL) at each dilution point
+```{r summary_lambda_8, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_8,
+      pars="lambda_rep",
+      digits=4)
+```
+
+```{r summary_lambda_new_8, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_8,
+      pars="lambda_new",
+      digits=4)
+```
+
+Estimates of the total number of molecules.
+```{r summary_total_mol_8, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_8,
+      pars="total_mol_rep",
+      digits=4)
+```
+
+```{r summary_total_mol_new_8, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_8,
+      pars="total_mol_new",
+      digits=4)
+```
+
+### PP Checks
+Posterior predictive checks
+#### Interval coverages for observations
+```{r check_coverage_pp_8, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(df_target$positives),
+                            yrep = log(la_8$y_rep[sample(1:6000, 200), ]))
+```
+
+#### Replicated min, mean, max, sd
+```{r replicated_checks_8, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = df_target$positives, 
+                    yrep = la_8$y_rep, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_8$y_rep, 
+                    stat = sd, 
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_8$y_rep, 
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat( y = df_target$positives, 
+                     yrep = la_8$y_rep, 
+                     stat = max,
+                     binwidth = 10)
+```
+
+#### Compare replicated k to observed k
+```{r posterior_predictive_plots_8_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = df_target$positives, yrep = la_8$y_rep, prob_outer = 0.9) +
+  scale_y_continuous(transform = "log10") + 
+  ylab("Count of positives")
+```
+
+The following comparisons are not directly related to assessing model fit. They are only to compare the model estimates to the Quantasoft estimates.
+#### Compare replicated lambda to "observed" lambda (concentration)
+```{r posterior_predictive_plots_8_2, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "Enterobacter(Patel)"),]$conc), yrep = (la_8$lambda_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+```{r posterior_predictive_plots_8_3, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "Enterobacter(Patel)"),]$conc), yrep = (la_8$lambda_new), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+#### Compare replicated total molecules to "observed"
+```{r posterior_predictive_plots_8_4, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "Enterobacter(Patel)"),]$total_mol_rxn), yrep = (la_8$total_mol_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_8_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "Enterobacter(Patel)"),]$total_mol_rxn), yrep = (la_8$total_mol_new), prob_outer = 0.9)  + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_8_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+plot_dat <- data.frame(x =  df_target$dilution_p,
+                       mols= df_dilution[which(df_dilution$target == "Enterobacter(Patel)"),]$total_mol_rxn)
+
+data.frame(x = exp(stan_dataList$xNew)/10000) %>%
+  add_draws(la_8$total_mol_pred) %>%
+  ggplot(aes(x = x, y = .value)) +
+  stat_lineribbon(alpha = 1/4) +
+  geom_point(aes(x = x, 
+                  y = mols),
+             data = plot_dat,
+             color = 'red') +
+  #scale_x_continuous(transform = "log10") +
+  #scale_y_continuous(transform = "log10") +
+  #xlim(0, 0.025) +
+  #ylim(0, 1000) +
+  theme_bw() +
+  xlab("Dilution") +
+  ylab("Predicted total molecules")
+   
+  # probability total molecules > x
+  plot(colSums(ifelse(la_8$total_mol_pred >= 10000, 1, 0))/6000 ~ stan_dataList$xNew, typ = 'l', ylab = "Probaility > 10,000 molecules", xlab = "dilution")
+```
+
+# Model 9: Gelman et al (2004) model with group effects
+```{stan bin_dilution_model_9, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_mod9"}
+data{
+ int <lower=1> N; // number of observations
+ int< lower=1 > U; //number unique standard concentrations
+ int <lower = 1> M; // number of new observations for prediction
+ int<lower=0> y[N]; // n success
+ int<lower=1> k[N]; // k trials
+ vector[N] x1; // covariate vector
+ vector[M] xNew; // dilution vector to predict to
+ int <lower = 1> group[N]; // dilution grouping
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0;
+ vector<lower = 0>[3] beta;
+ vector<lower = 0>[2] sigma;
+ vector[N] z_eps;
+ vector[U] z_nu;
+ }
+transformed parameters{
+ vector[N] eps = z_eps * sigma[1];
+ vector[U] nu = z_nu * sigma[2];
+ vector[N] g = a0 + (beta[1] / (1 + (x1 / beta[2]) ^ -beta[3]));
+ }
+model{
+ //priors
+ target += normal_lpdf(a0 | -2, 3);
+ target += normal_lpdf(beta[1] | 10, 5);
+ target += normal_lpdf(beta[2] | 0, 1);
+ target += normal_lpdf(beta[3] | 0, 2.5);
+ target += normal_lpdf(sigma | 0, 2.5);
+ target += normal_lpdf(z_eps | 0, 1);
+ target += normal_lpdf(z_nu | 0, 1);
+ 
+ //likelihood
+ for(i in 1:N)
+   target += binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps[i] + nu[group[i]]));
+   }
+generated quantities{
+ vector[N] eps_new;
+ vector[M] eps_pred;
+ vector[U] nu_new;
+ vector[M] nu_pred;
+ int y_rep[N];
+ int y_new[N];
+ real lambda_rep[N];
+ real lambda_new[N];
+ real lambda_pred[M];
+ real total_mol_rep[N];
+ real total_mol_new[N];
+ real total_mol_pred[M];
+ real log_lik[N];
+ 
+ for(u in 1:U){
+   nu_new[u] = normal_rng(0, sigma[2]);
+   }
+ for(i in 1:N){
+   eps_new[i] = normal_rng(0, sigma[1]);
+   y_rep[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps[i] + nu[group[i]]));
+   y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps_new[i] + nu_new[group[i]])); 
+   //std_normal_rng() * (g[i] ^ (2.0 * alpha)) * (sigma ^ 2.0)));
+   lambda_rep[i] = exp(g[i] + eps[i] + nu[group[i]]);
+   lambda_new[i] = exp(g[i] + eps_new[i] + nu_new[group[i]]);
+   //std_normal_rng() * (g[i] ^ (2.0 * alpha)) * (sigma ^ 2.0));
+   total_mol_rep[i] = lambda_rep[i] * 22;
+   total_mol_new[i] = lambda_new[i] * 22;
+   log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + g[i] + eps[i] + nu[group[i]]));
+   }
+ for(r in 1:M){
+   eps_pred[r] = normal_rng(0, sigma[1]);
+   nu_pred[r] = normal_rng(0, sigma[2]);
+   lambda_pred[r] = exp(a0 + (beta[1] / (1 + (xNew[r] / beta[2]) ^ -beta[3])) + eps_pred[r] + nu_pred[r]); 
+   //+ std_normal_rng() * (a0 + b1 * xNew[r] * (inv_logit((xNew[r] - c) * z)) ^ (2.0 * alpha)) * (sigma ^ 2.0));
+   total_mol_pred[r] = lambda_pred[r] * 22;
+   }
+ }
+```
+
+
+### Fitting the model
+We fit the model:
+```{r fit_9, echo=TRUE, cache=TRUE}
+fit_9 <- sampling(object = Bin_dilution_mod9,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  #control = list(adapt_delta = 0.925, max_treedepth = 14),
+                  seed = 165
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+```{r pairs_fit_9, echo=TRUE, warning=FALSE, message=FALSE, fig.asp=1, fig.width=6, fig.align='center'}
+pairs(fit_9, pars=c("a0", "beta", "sigma", "lp__"))
+```
+
+### Perform LOO
+```{r loo_model_9, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_9 <- loo::extract_log_lik(fit_9, parameter_name= "log_lik", merge_chains = FALSE)
+reff_9 <- loo::relative_eff(exp(log_lik_9),  cores = 1)
+loo_9 <- loo::loo(log_lik_9, r_eff = reff_9, cores = 1, save_psis = TRUE)
+print(loo_9)
+loo_compare(loo_1, loo_2, loo_3, loo_4, loo_5, loo_6, loo_7, loo_8, loo_9)
+plot(loo_9)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_9}
+la_9 <- extract(fit_9)
+wts_9 <- weights(loo_9$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_9, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_pit_ecdf(y = df_target$positives, 
+                    yrep = la_9$y_rep,
+                    lw = wts_9,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### Linear predictor
+```{r summary_9, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_9, 
+      pars=c("a0", "beta", "sigma", "lp__"),
+      digits=4)
+```
+
+#### $\lambda$ parameter
+Estimates of mean concentration (copies / uL) at each dilution point
+```{r summary_lambda_9, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_9,
+      pars="lambda_rep",
+      digits=4)
+```
+
+```{r summary_lambda_new_9, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_9,
+      pars="lambda_new",
+      digits=4)
+```
+
+Estimates of the total number of molecules.
+```{r summary_total_mol_9, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_9,
+      pars="total_mol_rep",
+      digits=4)
+```
+
+```{r summary_total_mol_new_9, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_9,
+      pars="total_mol_new",
+      digits=4)
+```
+
+### PP Checks
+Posterior predictive checks
+#### Interval coverages for observations
+```{r check_coverage_pp_9, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(df_target$positives),
+                            yrep = log(la_9$y_rep[sample(1:6000, 200), ]))
+```
+
+#### Replicated min, mean, max, sd
+```{r replicated_checks_9, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = df_target$positives, 
+                    yrep = la_9$y_rep, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_9$y_rep, 
+                    stat = sd, 
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_9$y_rep, 
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat( y = df_target$positives, 
+                     yrep = la_9$y_rep, 
+                     stat = max,
+                     binwidth = 10)
+```
+
+#### Compare replicated k to observed k
+```{r posterior_predictive_plots_9_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = df_target$positives, yrep = la_9$y_rep, prob_outer = 0.9) +
+  scale_y_continuous(transform = "log10") + 
+  ylab("Count of positives")
+```
+
+The following comparisons are not directly related to assessing model fit. They are only to compare the model estimates to the Quantasoft estimates.
+#### Compare replicated lambda to "observed" lambda (concentration)
+```{r posterior_predictive_plots_9_2, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_9$lambda_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+```{r posterior_predictive_plots_9_3, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_9$lambda_new), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+#### Compare replicated total molecules to "observed"
+```{r posterior_predictive_plots_9_4, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_9$total_mol_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_9_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_9$total_mol_new), prob_outer = 0.9)  + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_9_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+plot_dat <- data.frame(x =  df_target$dilution_p,
+                       mols= df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn)
+
+data.frame(x = stan_dataList$xNew) %>%
+  add_draws(la_9$total_mol_pred) %>%
+  ggplot(aes(x = x, y = .value)) +
+  stat_lineribbon(alpha = 1/4) +
+  geom_point(aes(x = x, 
+                  y = mols),
+             data = plot_dat,
+             color = 'red') +
+  scale_x_continuous(transform = "log10") +
+  scale_y_continuous(transform = "log10") +
+  #xlim(0, 0.01) +
+  #ylim(0, 10000) +
+  theme_bw() +
+  xlab("log10 dilution") +
+  ylab("log10 predicted total molecules")
+   
+  # probability total molecules > x
+  plot(colSums(ifelse(la_9$total_mol_pred >= 10000, 1, 0))/6000 ~ stan_dataList$xNew, typ = 'l', ylab = "Probaility > 10,000 molecules", xlab = "dilution")
+```
+
+
+
+
+
+
+
+
+

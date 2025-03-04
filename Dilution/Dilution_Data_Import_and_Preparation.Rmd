@@ -1,0 +1,117 @@
+---
+title: "NRSA Dilution Study: Data import and preparation for modeling and analyses"
+author: "Roy Martin"
+date: sys.date()
+output: github_document
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    keep_html: true
+---
+
+# Setup R
+Set the workding directory and load relevant packages:
+```{r setup_dir_packages, echo=TRUE, warning=FALSE, message=FALSE}
+
+#set directories and R package library
+setwd("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/Keely_Dilution/")
+
+
+library(readxl)
+library(tidyverse)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# Import data
+To begin, we import the dilution dataset from the [@Dorazio_Hunter_2015] article supplement.
+```{r import_data, echo=TRUE, warning=FALSE, message=FALSE, cache=TRUE, paged.table=TRUE}
+data_path <- "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/Keely_Dilution/"
+
+#importa data to object
+dil_dat_import <- read_xlsx("Pool2-ddPCR-data_compiled_20240819 1.xlsx",
+                     sheet = "compiled data",
+                     range = "A1:L3393",
+                     col_types = "text")
+
+
+print(dil_dat_import)
+```
+
+# Prepare for modeling
+Below, a data frame was created using the imported data. The new data frame has simpler naming conventions.
+```{r clean_data, echo=TRUE, warning=FALSE, message=FALSE, cache=TRUE, paged.table=TRUE}
+dil_dat <- dil_dat_import %>%
+  rename(plate = `PCR Plate #`,
+         sample = Sample,
+         target = Target,
+         conc = `Conc(copies/µL)`,
+         copies_per_rxn = `Quantasoft estimate of copies/reaction`,
+         droplets = `Accepted Droplets`,
+         positives = Positives,
+         mol_per_droplet = `avg molec per drop (-ln(1-(pos/total)))`,
+         mol_n = `molecules in n (avg molecules/drop*n)`,
+         ul_well = `ul in the well (n*0.85nl/droplet)`,
+         factor = `factor ((reaction vol (ul)* # reactions)/ul in the well)`,
+         total_mol_rxn = `total molec in rxn (molecules in n*factor*dilution factor)`) %>%
+  mutate(plate = case_when(plate == "redo1" ~ "38", # fix plate labels (some are "redo1" etc, others are integers: 1, 2, 3, etc)
+                           plate == "redo2" ~ "39",
+                           plate == "redo3" ~ "40",
+                           plate == "redo4" ~ "41",
+                           plate == "redo5" ~ "42",
+                           plate == "redo6" ~ "43",
+                           plate == "redo7" ~ "44",
+                           .default = as.character(plate))) %>%
+  mutate(plate = factor(plate),
+         sample = factor(sample),
+         target = factor(target),
+         conc = round(as.numeric(conc), 1),
+         copies_per_rxn = round(as.numeric(copies_per_rxn), 1),
+         droplets = as.integer(droplets),
+         positives = as.integer(positives),
+         mol_per_droplet = round(as.numeric(mol_per_droplet), 3),
+         mol_n = round(as.numeric(mol_n), 1),
+         ul_well = round(as.numeric(ul_well), 1),
+         factor = round(as.numeric(factor), 3),
+         total_mol_rxn = round(as.numeric(total_mol_rxn), 1))
+
+
+
+
+
+# export a csv file for modeling
+write.csv(dil_dat, file = "dil_dat_model.csv", row.names = FALSE)
+
+print(dil_dat)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

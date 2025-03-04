@@ -1,0 +1,374 @@
+---
+title: "NRSA Dilution Study: Modeling and analyses"
+author: "Roy Martin"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  github_document:
+    number_sections: TRUE
+    df_print: paged
+    math_method: 
+      engine: webtex
+    #  url: https://latex.codecogs.com/svg.image?
+    html_preview: TRUE
+    keep_html: TRUE
+editor_options:
+  chunk_output_type: inline
+  markdown: 
+    wrap: 72
+---
+
+# Setup R
+Set the workding directory and load relevant packages:
+```{r setup_dir_packages, echo=TRUE, warning=FALSE, message=FALSE}
+
+#set directories and R package library
+setwd("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/Keely_Dilution/")
+
+library(ggplot2)
+library(ggExtra)
+library(gridExtra)
+library(stringr)
+library(readxl)
+library(tidyverse)
+library(rstan)
+library(loo)
+library(bayesplot)
+library(tidybayes)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# Data
+Import the "cleaned" dilution data.
+```{r import_data, echo=TRUE, warning=FALSE, message=FALSE, cache=TRUE, paged.table=TRUE}
+df_dilution <- read.csv(file = "dil_dat_model.csv", row.names = NULL)
+
+print(df_dilution)
+```
+
+
+Create a data frame with a subset of the columns above that are used just for modeling. Also mutate the "sample" column into a numeric column coding the dilution 
+```{r import_data, echo=TRUE, warning=FALSE, message=FALSE, cache=TRUE, paged.table=TRUE}
+df_model <- df_dilution %>%
+  mutate(dilution = case_when(sample == "Pool2_10000" ~ 10000,
+                         sample == "Pool2_1000" ~ 1000,
+                         sample == "Pool2_100" ~ 100,
+                         sample == "Pool2_10" ~ 10,
+                         sample == "Pool2_5" ~ 5,
+                         sample == "NTC" ~ 0),
+         dilution_p = ifelse(dilution == 0, 0, dilution / 10000)) %>%
+  select(plate, target, dilution, dilution_p, droplets, positives)
+
+print(df_model)
+```
+
+Data are structured such that observations (N = 3392) of positive detections of droplets were nested within targets (L = 323) which were nested within plates (K = 43).
+
+```{r explore_data_1}
+df_model %>%
+  filter(target == "tetA(P)") %>%
+  ggplot(aes(x = dilution_p, y = positives)) + 
+    geom_smooth(method = "lm") + 
+    geom_point()
+```
+
+```{r explore_data_2}
+df_model %>%
+  filter(target == "tetA(P)") %>%
+  ggplot(aes(x = log10(dilution + 1), y = log10(positives + 1))) + 
+    geom_smooth(method = "lm") + 
+    geom_point()
+```
+
+
+```{r explore_data_3}
+df_model %>%
+  #filter(target == "sul2_1") %>%
+  ggplot(aes(x = log(dilution + 1), y = log(positives + 1), group = target, color = target)) + 
+    geom_smooth(method = "lm") + 
+    geom_point() +
+    theme(legend.position="none")
+```
+
+```{r explore_data_4}
+df_model %>%
+  #filter(target == "sul2_1") %>%
+  filter(!is.na(positives),
+         !is.na(droplets)) %>%
+  mutate(prop_pos = positives / droplets,
+         logit_pos = ifelse(positives == 0, -10, log(prop_pos / (1 - prop_pos)))) %>%
+  ggplot(aes(x = log(dilution + 1), y = logit_pos, group = target, color = target)) + 
+    geom_smooth(method = "lm") + 
+    geom_point() +
+    ylab("logit(proportion positive droplets)") +
+    theme(legend.position = "none")
+```
+
+```{r explore_data_5}
+df_model %>%
+  #filter(target == "sul2_1") %>%
+  filter(!is.na(positives),
+         !is.na(droplets)) %>%
+  mutate(prop_pos = positives / droplets,
+         cloglog_pos = ifelse(positives == 0, -8, log(-log(1 - prop_pos)))) %>%
+  ggplot(aes(x = log(dilution + 1), y = cloglog_pos, group = target, color = target)) + 
+    geom_smooth(method = "lm") + 
+    geom_point() +
+    ylab("clog-log(proportion positive droplets)") +
+    theme(legend.position = "none")
+```
+
+
+# Model 1: varying intercepts for dilution groups and observations (partial pooling)
+```{stan bin_dilution_model_1, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_mod1"}
+data{
+ int <lower=1 > N; // number of observations
+ int <lower = 1> T; // number of targets
+ int <lower = 1> M; // number of dilution points to predict to
+ int< lower=1 > U; //number unique standard concentrations
+ matrix < lower=0 > y[N, T];  // n success
+ matrix < lower=1 > k[N, T];  // k trials
+ vector[N] x1;  // covariate vector
+ // vector[M] xNew; // covariate vector for new dilution points
+ // int<lower=1 , upper=U> group[N]; // Grouping for estimates at U unique standard concns
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0; // obs-level mean of success (cloglog)
+ real b1; // obs-level covariate slope
+ // vector[U] z_gamma;
+ // real<lower=0> sigma_g;
+ vector[N] z_alpha;
+ real<lower = 0> sigma_a;
+ }
+transformed parameters{
+ vector[U] gamma = z_gamma * sigma_g;
+ vector[N] alpha = z_alpha * sigma_a;
+}
+model{
+ //priors
+ target += normal_lpdf(a0 | 0, 2.5);
+ target += normal_lpdf(b1 | 1, 0.25);
+ // target += normal_lpdf(sigma_g | 0, 2.5);
+ // target += normal_lpdf(z_gamma | 0, 1);
+ target += normal_lpdf(sigma_a | 0, 2.5);
+ target += normal_lpdf(z_alpha | 0, 1);
+ 
+ //likelihood
+ // for(i in 1:N)
+  // target += binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + alpha[i] + gamma[group[i]]));
+  target += binomial_lpmf(y | k, inv_cloglog(log(vol_c) + a0 + b1 * x1 + alpha));
+  }
+generated quantities{
+ // real gamma_new[U];
+ real alpha_new[N];
+ int y_rep[N];
+ int y_new[N];
+ real lambda_rep[N];
+ real lambda_new[N];
+ // real lambda_pred[M];
+ real total_mol_rep[N];
+ real total_mol_new[N];
+ // real total_mol_pred[M];
+ real log_lik[N];
+
+ // for(u in 1:U){
+  // gamma_new[u] = normal_rng(0, sigma_g);
+  // }
+ for(i in 1:N){
+  alpha_new[i] = normal_rng(0, sigma_a);
+  y_rep[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + gamma[group[i]] + alpha[i]));
+  y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + gamma_new[group[i]] + alpha_new[i]));
+  lambda_rep[i] = exp(a0 + b1 * x1[i] + gamma[group[i]] + alpha[i]);
+  lambda_new[i] = exp(a0 + b1 * x1[i] + gamma_new[group[i]] + alpha_new[i]);
+  total_mol_rep[i] = lambda_rep[i] * 22;
+  total_mol_new[i] = lambda_new[i] * 22;
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + gamma[group[i]] + alpha[i]));
+  }
+ // for(r in 1:M){
+  // lambda_pred[r] = exp(a0 + b1 * xNew[r] + normal_rng(0, sigma_g) + normal_rng(0, sigma_a)); 
+  // total_mol_pred[r] = lambda_pred[r] * 22;
+  // }
+  }
+```
+
+### Fitting the varying intercepts and slopes model to our data
+We fit the model:
+```{r fit_1, echo=TRUE, cache=TRUE}
+fit_1 <- sampling(object = Bin_dilution_mod1,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  #control = list(adapt_delta = 0.995, max_treedepth = 12),
+                  seed = 4351
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+```{r pairs_fit_1, echo=TRUE, warning=FALSE, message=FALSE, fig.asp=1, fig.width=6, fig.align='center'}
+pairs(fit_1, pars=c("a0", "b1", "sigma_g", "sigma_a", "lp__"))
+```
+
+### Perform LOO
+```{r loo_model_1, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_1 <- loo::extract_log_lik(fit_1, parameter_name= "log_lik", merge_chains = FALSE)
+reff_1 <- loo::relative_eff(exp(log_lik_1),  cores=1)
+loo_1 <- loo::loo(log_lik_1, r_eff = reff_1, cores = 1, save_psis = TRUE)
+print(loo_1)
+plot(loo_1)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_1}
+la_1 <- extract(fit_1)
+wts_1 <- weights(loo_1$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_1, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_pit_ecdf(y = df_target$positives, 
+                    yrep = la_1$y_rep,
+                    lw = wts_1,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_1, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_1, 
+      pars=c("a0", "b1", "sigma_g", "sigma_a", "lp__"),
+      digits=4)
+```
+
+#### $\lambda$ parameter
+Estimates of mean concentration (copies / uL) at each dilution point
+```{r summary_lambda_1, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_1,
+      pars="lambda_rep",
+      digits=4)
+```
+
+```{r summary_lambda_new_2, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_1,
+      pars="lambda_new",
+      digits=4)
+```
+
+Estimates of the total number of molecules.
+```{r summary_total_mol_3, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_1,
+      pars="total_mol_rep",
+      digits=4)
+```
+
+```{r summary_total_mol_new_4, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_1,
+      pars="total_mol_new",
+      digits=4)
+```
+
+### PP Checks
+Posterior predictive checks
+#### Interval coverages for observations
+```{r check_coverage_pp_1, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(df_target$positives),
+                            yrep = log(la_1$y_rep[sample(1:6000, 200), ]))
+```
+
+#### Replicated min, mean, max, sd
+```{r replicated_checks_1, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = df_target$positives, 
+                    yrep = la_1$y_rep, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_1$y_rep, 
+                    stat = sd, 
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = df_target$positives,
+                    yrep = la_1$y_rep, 
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat( y = df_target$positives, 
+                     yrep = la_1$y_rep, 
+                     stat = max,
+                     binwidth = 10)
+```
+
+#### Compare replicated k to observed k
+```{r posterior_predictive_plots_1_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = df_target$positives, yrep = la_1$y_rep, prob_outer = 0.9) +
+  scale_y_continuous(transform = "log10") + 
+  ylab("Count of positives")
+```
+
+The following comparisons are not directly related to assessing model fit. They are only to compare the model estimates to the Quantasoft estimates.
+#### Compare replicated lambda to "observed" lambda (concentration)
+```{r posterior_predictive_plots_1_2, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_1$lambda_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+```{r posterior_predictive_plots_1_3, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$conc), yrep = (la_1$lambda_new), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Concentration")
+```
+
+#### Compare replicated total molecules to "observed"
+```{r posterior_predictive_plots_1_4, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_1$total_mol_rep), prob_outer = 0.9) + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_1_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = (df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn), yrep = (la_1$total_mol_new), prob_outer = 0.9)  + 
+  scale_y_continuous(transform = "log10") + 
+  ylab("Total molecules")
+```
+
+```{r posterior_predictive_plots_1_5, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+plot_dat <- data.frame(x =  df_target$dilution_p,
+                       mols= df_dilution[which(df_dilution$target == "CowM3"),]$total_mol_rxn)
+
+data.frame(x = (exp(stan_dataList$xNew) - 1)/10000) %>%
+  add_draws(la_1$total_mol_pred) %>%
+  ggplot(aes(x = x, y = .value)) +
+  stat_lineribbon(alpha = 1/4) +
+  geom_point(aes(x = x, 
+                  y = mols),
+             data = plot_dat,
+             color = 'red') +
+  #scale_x_continuous(transform = "log10") +
+  scale_y_continuous(transform = "log10") +
+  #xlim(0, 0.01) +
+  #ylim(0, 10000) +
+  theme_bw() +
+  xlab("Dilution") +
+  ylab("Predicted total molecules")
+   
+  # probability total molecules > x
+  plot(colSums(ifelse(la_1$total_mol_pred >= 10000, 1, 0))/6000 ~ stan_dataList$xNew, typ = 'l', ylab = "Probaility > 10,000 molecules", xlab = "dilution")
+```
+
+
+
+
+
+
+
