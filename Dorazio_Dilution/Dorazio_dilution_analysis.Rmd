@@ -1,0 +1,1180 @@
+---
+title: "Bayesian analysis of [@Dorazio_Hunter_2015] dilution data and model"
+author: Roy Martin, ORD\NERL\SED\EIB
+date: 08-19-2019
+output:
+  github_document:
+    number_sections: TRUE
+    df_print: "tibble"
+    math_method: 
+      engine: webtex
+    #  url: https://latex.codecogs.com/svg.image?
+    html_preview: TRUE
+    keep_html: TRUE
+bibliography: RWM_Endnote_Library.bib
+link-citations: yes
+editor_options:
+  chunk_output_type: inline
+  markdown: 
+    wrap: 72
+---
+
+# Background
+This is an RMarkdown documentation of a fully Bayesian implementation of the [@Dorazio_Hunter_2015] binomial model for analyzing dPCR experiments. Below, we implement the original model in $\textbf{Stan}$ [@Carpenter_etal_2015] and compare the results with the maximum likelihood estimates provided by [@Dorazio_Hunter_2015]. In subsequent comparisons, we implement partial pooling via hierarchical intercepts and/or slopes. We make comparisons using Bayesian leave-one-out cross validation ('LOO-CV') via the $\textbf{loo}$ package in $\textbf{R}$, which implements fast and stable computations for approximate LOO-CV [@Vehtari_etal_2017]. The computations are based on the log-likelihood evaluated at the posterior simulations of the parameter values for a fitted model, and result in point wise estimates of out-of-sample prediction accuracy.
+
+# Setup R
+Set the workding directory and load relevant packages:
+```{r setup_dir_packages, echo=TRUE, warning=FALSE, message=FALSE}
+
+#set directories and R package library
+setwd("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/Dorazio_Dilution")
+
+library(ggplot2)
+library(ggExtra)
+library(gridExtra)
+library(stringr)
+library(readxl)
+library(tidyverse)
+library(rstan)
+library(loo)
+library(bayesplot)
+library(tidybayes)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# Import data
+To begin, we import the dilution dataset from the [@Dorazio_Hunter_2015] article supplement.
+```{r import_data, echo=TRUE, warning=FALSE, message=FALSE, cache=TRUE, paged.table=TRUE}
+#importa data to object
+dil_dat <- read.table(file="dilutionData.csv", header=T, fill=TRUE, sep=",")
+
+print(dil_dat)
+```
+
+# Original analysis by [@Dorazio_Hunter_2015]
+Here, we estimate the parameters via maximum likelihood using $\textbf{glm()}$ in $\textbf{R}$, as performed in the article supplement:
+```{r ml_analysis}
+d <- read.csv(file = 'dilutionData.csv')
+y <- d[, 'npositive']
+m <- d[, 'ntotal']
+x <- d[,'conc']
+
+v <- 0.91 / 1000  # constant volume (microliters) per droplet (physical constant)
+
+
+
+# fit model using glm()
+v.offset <- rep(log(v), length(y))
+ymat <- cbind(y, m-y)
+fit <- glm(ymat ~ log(x), family = binomial(link = 'cloglog'), offset = v.offset)
+beta.mle <- fit$coefficients
+beta.vcv <- vcov(fit)
+beta.se <- sqrt(diag(beta.vcv))
+alpha <- 0.05  # significance level for confidence intervals
+zcrit <- qnorm(1 - alpha / 2)
+beta.lowerCL <- beta.mle - zcrit * beta.se
+beta.upperCL <- beta.mle + zcrit * beta.se
+deviance <- fit$deviance
+GOF <- 1 - pchisq(deviance, df = length(y) - length(beta.mle))
+
+# Estimate concentration of each dilution
+X <- model.matrix(~ log(x))
+X.pred <- unique(X)
+lambda.est <- rep(NA, dim(X.pred)[1])
+lambda.lowerCL <- rep(NA, dim(X.pred)[1])
+lambda.upperCL <- rep(NA, dim(X.pred)[1])
+
+for(i in 1:dim(X.pred)[1]) {
+    Xvec <- matrix(X.pred[i, ], ncol = 1)
+    loglambda.est <- t(Xvec) %*% beta.mle
+    loglambda.var <- t(Xvec) %*% beta.vcv %*% Xvec
+    lambda.est[i] <- exp(loglambda.est)
+    lambda.lowerCL[i] <- exp(loglambda.est - zcrit * sqrt(loglambda.var))
+    lambda.upperCL[i] <- exp(loglambda.est + zcrit * sqrt(loglambda.var))
+    }
+
+# Summarize results
+beta.out <- cbind(beta.mle, beta.se, beta.lowerCL, beta.upperCL)
+dimnames(beta.out)[2] <- list(c('MLE', 'SE', '2.5%', '97.5%'))
+
+print(beta.out)
+
+lambda.out <- data.frame(cbind(standard = unique(x), lambda.est, lambda.lowerCL, lambda.upperCL))
+
+print(lambda.out)
+```
+
+# Fit a Bayesian version (complete pooling)
+Next, we'll construct a Bayesian version of the original model in the $\textbf{Stan}$ language. The model parameters are fit to the data via Hamiltonian Monte Carlo (HMC) as implemented in $\textbf{Stan}$ and via the $\textbf{R}$ interface.
+
+First, we write out a Bayesian interpretation of the model in the $\textbf{Stan}$ syntax. We also include an option to sample from the prior only, for prior predictive checking. We use wide uniform priors on the parameters which should provide a closer analogy to the MLE estimates above. 
+```{stan bin_dilution_model, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution"}
+data{
+ int< lower=1 > N;  // number of observations
+ int< lower=1 > U; //number unique standard concentrations
+ int< lower=0 > y[N];  // n success
+ int< lower=1 > trials[N];  // n trials
+ vector[N] x1;  // covariate vector
+ vector[U] x1_u; // for estimates at the U unique standard concns
+ int<lower=0, upper=1> prior_only; // should the likelihood be ignored?
+ 
+ vector< lower=0 >[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0; // population intercept
+ real b1; // pop-level slope
+ }
+model{
+ // initialize linear predictor term
+ vector[N] mu = a0 + x1 * b1 + log(vol_c);
+ 
+ // apply the inverse link function
+ mu = inv_cloglog(mu);
+ 
+ //Priors
+ target += uniform_lpdf(a0 | -10, 10); //normal_lpdf( a0 | 0, 4 );
+ target += uniform_lpdf(b1 | -10, 10); //normal_lpdf( b1 | 0, 4 );
+ 
+ //Likelihood
+ if(prior_only == 0) //update with data when prior_only == 0
+  target += binomial_lpmf(y | trials, mu);
+ }
+generated quantities{
+ real y_new[N];
+ real log_lik[N];
+ real lambda_mean_est[U];
+ vector[N] mu = a0 + x1 * b1 + log(vol_c);
+
+ for(i in 1:N) {
+  // compute marginal posterior predictive distribution for y
+  y_new[i] = binomial_rng(trials[i] , inv_cloglog(mu[i]));
+  // compute pointwise log-likelihoood
+  log_lik[i] = binomial_lpmf(y[i] | trials[i] , inv_cloglog(mu[i]));
+  }
+ 
+ for(u in 1:U)
+  // compute lambda for each unique concentration standard
+  lambda_mean_est[u] = exp(a0 + b1 * x1_u[u]);
+ }
+```
+
+## Prior predictive simulation
+Here, we want to check that our priors for the intercept, $\beta_0$, and slope, $\beta_1$, are sensible. We chose $\beta_0 \sim N(0, 4)$ and $\beta_1 \sim N(0, 4)$ First, we create a data list for Stan and code the parameter 'prior_only' = 1.
+```{r stan_data_1_prior, echo=TRUE, message=FALSE, warning=FALSE}
+stan_dataList_1_prior <- list(N = length(dil_dat$npositive),
+                               U =length(unique(dil_dat$conc)),
+                               y = dil_dat$npositive,
+                               trials = dil_dat$ntotal,
+                               x1 = log(dil_dat$conc),
+                               x1_u = log(unique(dil_dat$conc)), 
+                               vol_c = rep((0.91 / 1000), nrow(dil_dat)),
+                               prior_only = 1 # sample from prior only? 
+                               )
+```
+
+We run the model without updating with the observed data to investigate our priors.
+```{r fit_stan_model_1_prior, echo=TRUE, cache=TRUE}
+fit_1_prior <- sampling(object = Bin_dilution,
+                        data = stan_dataList_1_prior,
+                        chains = 4,
+                        iter = 2000,
+                        cores = 4,
+                        seed = 1234
+                        )
+```
+We can ignore the warnings in this particular case. These are a result of trying to calculate the pointwise log-likelihood in the generated quantities block.
+
+Lets look at a pairs plot to assess HMC sampling.
+```{r pairs_fit_1_prior, echo=TRUE, warning=FALSE, message=FALSE, fig.width=5, fig.height=5, fig.align='center'}
+pairs(fit_1_prior, pars=c("a0", "b1", "lp__"))
+```
+
+### Print parameter summaries
+Now lets print the parameter summaries, which should just give us back summaries of our priors.
+```{r summary_beta_1_prior, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_1_prior, pars=c("a0", "b1", "lp__"), digits=4)
+```
+
+### Prior predictive Checks
+Here we can look at what our priors imply for the prior predictive distribution. We'll look at the distribution of the mean, min, and max for replicated datasets.
+#### Replicated min, mean, max, sd
+```{r posterior_predictive_plots_1_2_prior, echo=FALSE, fig.align='center', fig.height=4, fig.width=6, message=FALSE, warning=FALSE}
+la_1_prior <- extract(fit_1_prior)
+
+bayesplot::ppc_stat(y = dil_dat$npositive, 
+                    yrep = la_1_prior$y_new, 
+                    stat = mean)
+
+bayesplot::ppc_stat(y = dil_dat$npositive, 
+                    yrep = la_1_prior$y_new, 
+                    stat = min)
+
+bayesplot::ppc_stat(y = dil_dat$npositive, 
+                    yrep = la_1_prior$y_new, 
+                    stat = max)
+```
+
+#### Marginal predictions along concentration gradient
+We can also summarize 'npositive' replicated from prior model along the concentration gradient. We have the observed 'npositive' here as well, but only because it is included as part of a convenient $\textbf{bayesplot}$ function. Specifically, we're looking at the log-scale 'npositive' vs. $y_{rep}$, or the prior preditive distribution of log( 'npositive' ).
+
+```{r posterior_predictive_plots_1_3_prior, echo=FALSE, fig.align="center", fig.height=4, fig.width=10, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = log(dil_dat$npositive), yrep = log(la_1_prior$y_new), x = log(dil_dat$conc)) 
+```
+
+## Fitting the original model to observed data
+Now lets fit the model to the actual data.
+
+The data list for Stan (with "prior_only" now set to $0$).
+```{r stan_data_1, echo=TRUE, message=FALSE, warning=FALSE}
+stan_dataList <- list(N = length( dil_dat$npositive),
+                      U = length( unique(dil_dat$conc)),
+                      y = dil_dat$npositive,
+                      trials = dil_dat$ntotal,
+                      x1 = log(dil_dat$conc),
+                      x1_u = log(unique(dil_dat$conc)), 
+                      vol_c = rep((0.91 / 1000), nrow(dil_dat)),
+                      prior_only = 0
+                      )
+```
+
+We fit the model:
+```{r fit_stan_model_1, echo=TRUE, cache=TRUE}
+fit_1 <- sampling(object = Bin_dilution,
+                  data= stan_dataList,
+                  chains = 4,
+                  iter = 2000,
+                  cores = 4,
+                  thin = 1,
+                  seed = 246
+                  )
+```
+
+Lets look at the pairs plot.
+```{r pairs_fit_1, echo=TRUE, warning=FALSE, message=FALSE, fig.width=5, fig.height=5, fig.align='center'}
+pairs(fit_1, pars=c("a0", "b1", "lp__"))
+```
+
+Note the strong correlation between samples of $\alpha_0$ and $\beta_1$. Thought this could frustrate HMC sampling, it does make practical sense in the context of the calibration curve. 
+
+### Print and compare parameter summaries
+Now lets print our Bayesian parameter estimates and compare them to the original ML estimates.
+
+First the Bayesian model estimates for the intercept and slope parameters:
+```{r summary_beta_1, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_1, pars=c("a0", "b1", "lp__"), digits = 3)
+```
+
+Then the ML estimates:
+```{r summary_beta_1_2, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(beta.out, digits = 2) #compare to MLE
+```
+
+To three digits, the Bayes model's parameter estimates are very close to the MLE. 
+
+Lets now compare the estimates for $\lambda$. First the estimates from the Bayesian model:
+```{r summary_lambda_1, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_1, pars = "lambda_mean_est", digits=2)
+```
+
+And then the ML estimates (with the values for the standard first):
+```{r summary_lambda_1_2, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+#compare to MLE
+print(lambda.out, digits = 3)
+```
+
+Again, the estimates from the Bayesian model are very close to those from the ML implementation.
+
+### PP Checks
+Lets now run some posterior predictive checks on our Bayesian model.
+
+#### Density overlay
+First we'll do a simple density overlay. The blue lines are density estimates for log( npositive ) from each of 100 replicate 'datasets' from the fitted model's posterior predictive distribution. The black line is the density for log( npositive) of the observed data. 
+
+```{r posterior_predictive_plots_1_1, echo=FALSE, fig.align='center', fig.height=4, fig.width=6, message=FALSE, warning=FALSE}
+bayesplot::ppc_dens_overlay(y = log(dil_dat$npositive),
+                             yrep = log(extract(fit_1)$y_new[sample(1:2000, 100), ]))
+```
+
+It looks like our model isn't doing a great job of generating replicate datasets that resemble the observed data. So our approximation of the 'data generating process' could probably use some more work. This result may also suggest that the ML implementation is similarly lacking. In the models to follow, we add some additional model structure in hopes of getting a better approximation.
+
+#### Replicated min, mean, max, sd
+Before we move on to another model, we can look at a few other posterior predictive checks. Here we're going to look at how well our model replicates the mean, standard deviation, min, and max 'npositive' from the observed data. 
+```{r posterior_predictive_plots_1_2, echo=FALSE, fig.align='center', fig.width=6, fig.asp=0.75, message=FALSE, warning=FALSE}
+bayesplot::ppc_stat(y = dil_dat$npositive , 
+                    yrep = extract(fit_1)$y_new , 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = dil_dat$npositive, 
+                    yrep = extract(fit_1)$y_new, 
+                    stat = sd,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = dil_dat$npositive, 
+                    yrep = extract(fit_1)$y_new,
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = dil_dat$npositive,
+                    yrep = extract(fit_1)$y_new, 
+                    stat = max,
+                    binwidth = 10)
+```
+
+Our model is actually doing a decent job at replicating these aspects of the observed data. 
+
+#### Marginal predictions along concentration gradient
+We can look again at the posterior predictive distributions for individual observations along the concentration gradient. 
+```{r posterior_predictive_plots_1_3, echo=FALSE, fig.align="center", fig.width=8, fig.asp=0.75, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = log(dil_dat$npositive), yrep = log(extract(fit_1)$y_new), x = log(dil_dat$conc))
+```
+
+In this case, we can see that our model conveys a great deal of certainty at the observation level. So much that it is a little difficult to discern much with regard to calibration, etc from the scale of this figure. We'll move on for now though.
+
+### Perform LOO
+```{r loo_model_1, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_1 <- loo::extract_log_lik(fit_1, parameter_name= "log_lik", merge_chains = FALSE)
+reff_1 <- loo::relative_eff(exp(log_lik_1),  cores=1)
+loo_1 <- loo::loo(log_lik_1, r_eff = reff_1, cores = 1, save_psis = TRUE)
+print(loo_1)
+plot(loo_1)
+```
+
+All pareto shape k estimates are satisfactory.
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_1}
+la_1 <- extract(fit_1)
+wts_1 <- weights(loo_1$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_1, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.75}
+ppc_loo_pit_overlay(y = dil_dat$npositive, 
+                    yrep = la_1$y_new,
+                    lw = wts_1,
+                    samples = 50)
+```
+The LOO-PIT figure above suggests that this model is not doing a great job of replicating the observed data and may not be an ideal candidate for approximating the true data generating process.
+
+# Observation-level varying effects
+Next we'll fit a partial pooling model using via rstan.
+
+First, we write out the model in the Stan syntax:
+
+```{stan bin_dilution_model_pp, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_pp"}
+data{
+ int<lower=1> N;  // number of observations
+ int<lower=1> U; //number unique standard concentrations
+ int<lower=0> y[N];  // n success
+ int<lower=1> k[N];  // k trials
+ vector[N] x1;  // covariate vector
+ vector[U] x1_u; // for estimates at U unique standard concns
+ 
+ vector<lower = 0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0;  // pop-level mean of success 
+ real b1;  // pop-level covariate slope
+ vector[N] alpha_z; //standard normal pertubation term for non-centered parameterization
+ real<lower = 0> sigma;
+ }
+transformed parameters{
+ vector[N] alpha = sigma * alpha_z; // observation level random effect
+}
+model{
+ //priors
+ target += normal_lpdf(a0 | 0, 5);
+ target += normal_lpdf(b1 | 0, 2.5);
+ target += normal_lpdf(sigma | 0, 1.5);
+ target += normal_lpdf(alpha_z | 0, 1);
+ 
+ //likelihood
+ target += binomial_lpmf(y | k, inv_cloglog(log(vol_c) + a0 + b1 * x1 + alpha));
+ }
+generated quantities{
+ int y_new[N];
+ real log_lik[N];
+ real lambda_mean_est[U];
+ real lambda_new[U];
+
+ for(i in 1:N){
+  y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + normal_rng(a0 + b1 * x1[i] , sigma)));
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + alpha[i]));
+  }
+ 
+ for(u in 1:U){
+  lambda_mean_est[u] = exp(a0 + b1 * x1_u[u]);
+  lambda_new[u] = exp(normal_rng(a0 + b1 * x1_u[u] , sigma));
+  }
+ }
+```
+
+
+### Fitting varying intercepts
+
+The data list for Stan:
+```{r stan_data_pp_2, echo=TRUE, message=FALSE, warning=FALSE}
+stan_dataList <- list(N = length(dil_dat$npositive),
+                      U = length(unique( dil_dat$conc)),
+                      y = dil_dat$npositive,
+                      k = dil_dat$ntotal,
+                      x1 = log(dil_dat$conc),
+                      x1_u = log(unique(dil_dat$conc)), 
+                      vol_c = rep((0.91/1000), nrow(dil_dat))
+                      )
+```
+
+We fit the model:
+```{r fit_stan_model_pp_2, echo=TRUE, cache=TRUE}
+fit_2 <- sampling(object = Bin_dilution_pp,
+                  data=stan_dataList,
+                  chains=4,
+                  iter=3000,
+                  cores=4,
+                  thin=1,
+                  seed = 456
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+
+```{r pairs_fit_pp_2, echo=TRUE, warning=FALSE, message=FALSE, fig.width=6, fig.asp=1, fig.align='center'}
+pairs(fit_2, pars=c("a0", "b1", "sigma", "lp__"))
+```
+
+Again, strong correlation among samples of $\alpha_0$ and $\beta_1$.
+
+### Perform LOO
+```{r loo_model_2, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_2 <- loo::extract_log_lik(fit_2, parameter_name= "log_lik", merge_chains = FALSE)
+reff_2 <- loo::relative_eff(exp(log_lik_2),  cores=1)
+loo_2 <- loo::loo(log_lik_2, r_eff = reff_2, cores = 1, save_psis = TRUE)
+print(loo_2)
+plot(loo_2)
+```
+
+Nearly half of the observations are with k > 0.7.
+
+Lets try moment matching.
+```{r mod2_reloo, eval=F}
+#reloo_2 <- reloo(x = mod1, loo = loo_1)
+
+loo_2_mm <- loo_moment_match(fit_2, loo = loo_2) # this takes a while
+
+print(loo_2_mm)
+plot(loo_2_mm)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_2}
+la_2 <- extract(fit_2)
+wts_2 <- weights(loo_2$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_2, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_loo_pit_overlay(y = dil_dat$npositive, 
+                    yrep = la_2$y_new,
+                    lw = wts_2,
+                    samples = 50)
+```
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_beta_pp_2, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_2, pars=c("a0", "b1", "sigma", "lp__"), digits=4)
+print(beta.out) #compare to MLE
+```
+
+Nevertheless, we get similar parameter estimates as in the previous model and the MLE model, as $\sigma$ is estimated to be fairly small. 
+
+#### $\lambda$ parameter
+```{r summary_lambda_pp_2, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print( fit_2, pars = "lambda_mean_est", digits = 4 )
+print( fit_2, pars="lambda_new", digits = 4 )
+data.frame( cbind( standard = unique(x) , lambda.est, lambda.lowerCL , lambda.upperCL ) )#compare to MLE
+```
+
+The $\lambda$ estimates are pretty similar as well, but suggest more uncertainty compared to the previous model and MLE. We also have estimates that consider 'population' level replicates, which are wider still, as expected. The latter estimate considers variation at the observation level (in this case, simulating new dPCR replicates for each observation). 
+
+### PP Checks
+
+#### Interval coverages for observations
+```{r check_coverage_pp_2, fig.align='center', fig.asp=0.75, fig.width=6}
+la2 <- extract(fit_2)
+
+bayesplot::ppc_dens_overlay(y = log(dil_dat$npositive),
+                            yrep = log(extract(fit_2)$y_new[sample( 1:2000, 50), ]))
+```
+
+In this case, the npositive estimates at lower concentrations look to be better fit by this model.
+
+#### Replicated min, mean, max, sd
+
+```{r replicated_checks_pp_2, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = dil_dat$npositive, 
+                    yrep = extract(fit_2)$y_new, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = dil_dat$npositive, 
+                    yrep = extract(fit_2)$y_new,
+                    stat = sd,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = dil_dat$npositive,
+                    yrep = extract(fit_2)$y_new, 
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = dil_dat$npositive, 
+                    yrep = extract(fit_2)$y_new, 
+                    stat = max,
+                    binwidth = 10)
+```
+
+
+#### Compare replicated k to observed k
+```{r posterior_predictive_plots_2_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = log(dil_dat$npositive), yrep = log(extract(fit_2)$y_new))
+```
+
+Again, there seems to be some consistent under- and overestimation. Note that there the differences between the replications and 'population' level replications is pretty minor as $\sigma$ was estimated to be relatively small. 
+
+# Varying effects for concentration groups
+
+We write out a Bayesian interpretation of the model in the Stan syntax:
+
+```{stan bin_dilution_model_pp_g, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_pp_g"}
+data{
+ int <lower=1 > N;  // number of observations
+ int< lower=1 > U; //number unique standard concentrations
+ int< lower=0 > y[N];  // n success
+ int< lower=1 > k[N];  // k trials
+ vector[N] x1;  // covariate vector
+ vector[U] x1_u;
+ int<lower=1 , upper=U> group[N]; // Grouping for estimates at U unique standard concns
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ }
+parameters{
+ real a0;  // obs-level mean of success (cloglog)
+ real b1;  // obs-level covariate slope
+ vector[U] z_gamma;
+ real< lower=0 > sigma_g;
+ }
+transformed parameters{
+ vector[U] gamma = z_gamma * sigma_g;
+}
+model{
+ //priors
+ target += normal_lpdf(a0 | 0 , 5);
+ target += normal_lpdf(b1 | 0 , 2.5);
+ target += normal_lpdf(sigma_g | 0 , 1.5);
+ target += normal_lpdf(z_gamma | 0, 1);
+ 
+ //likelihood
+ for(i in 1:N)
+  target += binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + gamma[group[i]]));
+ }
+generated quantities{
+ int y_new[N];
+ real gamma_new[U];
+ real log_lik[N];
+ real lambda_mean_est[U];
+ real lambda_new[U];
+
+ for(u in 1:U){
+  gamma_new[u] = normal_rng(0, sigma_g);
+  }
+ for(i in 1:N){
+  y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i]  + gamma_new[group[i]]));
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + gamma[group[i]]));
+  }
+ 
+ for(u in 1:U){
+  lambda_mean_est[u] = exp(a0 + b1 * x1_u[u]);
+  lambda_new[u] = exp(a0 + b1 * x1_u[u] + gamma_new[u]);
+  }
+ }
+```
+
+###Fitting the varying intercepts and slopes model to our data
+
+The data list for Stan:
+```{r stan_data_pp_g_3, echo=TRUE, message=FALSE, warning=FALSE}
+stan_dataList <- list(N = length(dil_dat$npositive), 
+                      U = length(unique(dil_dat$conc)),
+                      y = dil_dat$npositive,
+                      k = dil_dat$ntotal, 
+                      x1 = log(dil_dat$conc),
+                      x1_u = log(unique(dil_dat$conc)),
+                      group = c(1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                                2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                                3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+                                4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+                                5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+                                6, 6, 6, 6, 6, 6, 6, 6, 6, 6),
+                      vol_c = rep((0.91 / 1000), nrow(dil_dat))
+                      )
+```
+
+We fit the model:
+```{r fit_stan_model_pp_g_3, echo=TRUE, cache=TRUE}
+fit_3 <- sampling(object = Bin_dilution_pp_g,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  control = list(adapt_delta = 0.995, max_treedepth = 14),
+                  seed = 2468
+                  )
+```
+
+
+Lets look at a pairs plot to assess sampling.
+```{r pairs_fit_pp_g_3, echo=TRUE, warning=FALSE, message=FALSE, fig.align='center', fig.asp=1, fig.width=6}
+pairs(fit_3,
+      pars=c(
+        "a0",
+        "b1",
+        "sigma_g",
+        "lp__"
+        ))
+```
+
+<br>
+
+### Perform LOO
+
+```{r loo_model_3, warning=FALSE, message=FALSE, echo=TRUE, fig.align='center', fig.asp=0.75, fig.width=6}
+log_lik_3 <- loo::extract_log_lik(fit_3, parameter_name= "log_lik", merge_chains = FALSE)
+reff_3 <- loo::relative_eff(exp(log_lik_3),  cores=1)
+loo_3 <- loo::loo(log_lik_3, r_eff = reff_3, cores = 1, save_psis = TRUE)
+print(loo_3)
+plot(loo_3)
+
+#compare original model to partial pooling at observation level, vs. group level
+loo::compare(loo_1, loo_2, loo_3)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_3}
+la_3 <- extract(fit_3)
+wts_3 <- weights(loo_3$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_3, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_loo_pit_overlay(y = dil_dat$npositive, 
+                    yrep = la_3$y_new,
+                    lw = wts_3,
+                    samples = 50)
+```
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_beta_pp_g_3, echo=TRUE, warning=FALSE, essage=FALSE}
+print(fit_3,
+      pars=c(
+        "a0",
+        "b1",
+        "sigma_g",
+        "lp__"
+        ),
+      digits=4)
+
+print(beta.out) #compare to MLE
+```
+
+#### $\lambda$ parameter
+```{r summary_lambda_pp_g_3, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_3,
+      pars = "lambda_mean_est",
+      digits = 4)
+
+print(fit_3,
+      pars = "lambda_new",
+      digits = 4)
+
+lambda.out #compare to MLE
+```
+
+### PP Checks
+
+#### Interval coverages for observations
+```{r check_coverage_pp_g_3, fig.align='center', fig.asp=0.75, fig.width=6}
+la3 <- extract(fit_3)
+
+bayesplot::ppc_dens_overlay(y = log(dil_dat$npositive), yrep = log(la3$y_new[sample(1:6000, 50), ]))
+```
+
+#### Replicated min, mean, max, sd
+
+```{r replicated_checks_pp_g_3, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat(y = dil_dat$npositive, 
+                    yrep = la3$y_new, 
+                    stat = mean,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = dil_dat$npositive, 
+                    yrep = la3$y_new,
+                    stat = sd,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = dil_dat$npositive, 
+                    yrep = la3$y_new,
+                    stat = min,
+                    binwidth = 1)
+
+bayesplot::ppc_stat(y = dil_dat$npositive,
+                    yrep = la3$y_new, 
+                    stat = max,
+                    binwidth = 10)
+```
+
+
+#### Compare replicated k to observed k
+
+```{r posterior_predictive_plots_3_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = log(dil_dat$npositive), yrep = log(la3$y_new))
+```
+
+
+# Varying effects for conc groupings and observation-level
+
+```{stan bin_dilution_model_pp_g_o, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_pp_g_o"}
+data{
+ int<lower=1> N;  // number of observations
+ int<lower=1> U; //number unique standard concentrations
+ int<lower=0> y[N];  // n success
+ int<lower=1> k[N];  // k trials
+ vector[N] x1;  // covariate vector
+ vector[U] x1_u;
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ int<lower=1 , upper=U> group[N]; // Grouping for estimates at U unique standard concns
+ }
+
+parameters{
+ real a0;  // pop-level mean of success (cloglog)
+ real b1;  // pop-level covariate slope
+ vector[N] z_alpha; //unit normal perturbation for non-centered parameterization
+ vector[U] z_gamma;
+ real<lower=0> sigma;
+ real<lower=0> sigma_g;
+ }
+
+transformed parameters{
+ vector[N] alpha = z_alpha * sigma;
+ vector[U] gamma = z_gamma * sigma_g;
+ }
+
+model{
+ //priors
+ target += normal_lpdf(a0 | 0, 5);
+ target += normal_lpdf(b1 | 0, 2.5);
+ target += normal_lpdf(sigma | 0, 1.5);
+ target += normal_lpdf(sigma_g | 0, 1.5);
+ target+= normal_lpdf(z_gamma | 0, 1);
+ target += normal_lpdf(z_alpha | 0, 1);
+ 
+ //likelihood
+ for(n in 1:N)
+  target += binomial_lpmf(y[n] | k[n], inv_cloglog(log(vol_c[n]) + a0 + b1 * x1[n] + alpha[n] + gamma[group[n]]));
+ }
+
+generated quantities{
+ int y_new[N];
+ real log_lik[N];
+ real lambda_mean_est[U];
+ real lambda_new[U];
+ 
+ for(u in 1:U){
+  lambda_mean_est[u] = exp(a0 + b1 * x1_u[u]);
+  lambda_new[u] = exp(normal_rng(a0 + b1 * x1_u[u], sigma) + normal_rng(0, sigma_g));
+  }
+  
+ for(i in 1:N){
+  y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i]  + normal_rng(0, sigma) + normal_rng(0, sigma_g)));
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + b1 * x1[i] + alpha[i] + gamma[group[i]]));
+  }
+ }
+```
+
+### Fitting the varying intercepts and slopes model to our data
+
+The data list for Stan:
+```{r stan_data_pp_g_o_4, echo=TRUE, message=FALSE, warning=FALSE}
+stan_dataList <- list(N = length(dil_dat$npositive),
+                      U = length(unique(dil_dat$conc)),
+                      y = dil_dat$npositive,
+                      k = dil_dat$ntotal,
+                      x1 = log(dil_dat$conc),
+                      x1_u = log(unique(dil_dat$conc)),
+                      group = c(1,1,1,1,1,1,1,1,1,1,
+                                 2,2,2,2,2,2,2,2,2,2,
+                                 3,3,3,3,3,3,3,3,3,3,
+                                 4,4,4,4,4,4,4,4,4,4,
+                                 5,5,5,5,5,5,5,5,5,5,
+                                 6,6,6,6,6,6,6,6,6,6),
+                      vol_c = rep((0.91/1000), nrow(dil_dat))
+                      )
+```
+
+We fit the model:
+```{r fit_stan_model_pp_g_o_4, echo=TRUE, cache=TRUE}
+fit_4 <- sampling(object = Bin_dilution_pp_g_o,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  control = list(adapt_delta = 0.995, max_treedepth = 14),
+                  seed = 1235
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+
+```{r pairs_fit_pp_g_o_4, echo=TRUE, warning=FALSE, message=FALSE, fig.asp=1, fig.width=6, fig.align='center'}
+pairs(fit_4,
+      pars=c(
+        "a0",
+        "b1",
+        "sigma",
+        "sigma_g",
+        "lp__"
+        ))
+
+```
+
+### Perform LOO
+
+```{r loo_model_4, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_4 <- loo::extract_log_lik(fit_4, parameter_name= "log_lik", merge_chains = FALSE)
+reff_4 <- loo::relative_eff(exp(log_lik_4),  cores=1)
+loo_4 <- loo::loo(log_lik_4, r_eff = reff_4, cores = 1, save_psis = TRUE)
+print(loo_4)
+plot(loo_4)
+
+#compare original model to partial pooling
+loo::compare(loo_1, loo_2 , loo_3, loo_4)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_4}
+la_4 <- extract(fit_4)
+wts_4 <- weights(loo_4$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_4, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_loo_pit_overlay(y = dil_dat$npositive, 
+                    yrep = la_4$y_new,
+                    lw = wts_4,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_beta_pp_g_o_4, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_4,
+      pars=c(
+        "a0",
+        "b1",
+        "sigma",
+        "sigma_g",
+        "lp__"
+      ),
+      digits=4)
+
+print(beta.out) #compare to MLE
+```
+
+#### $\lambda$ parameter
+```{r summary_lambda_pp_g_o_4, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_4,
+      pars="lambda_mean_est",
+      digits=4)
+
+print(fit_4,
+      pars="lambda_new",
+      digits=4)
+
+lambda.out # compare to MLE
+```
+
+### PP Checks
+
+#### Interval coverages for observations
+```{r check_coverage_pp_g_o_4, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(dil_dat$npositive),
+                            yrep = log(la_4$y_new[sample(1:2000, 50), ]))
+```
+
+#### Replicated min, mean, max, sd
+
+```{r replicated_checks_pp_g_o_4, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat( y = dil_dat$npositive , 
+                     yrep = la_4$y_new , 
+                     stat = mean ,
+                     binwidth = 1)
+
+bayesplot::ppc_stat( y = dil_dat$npositive , 
+                     yrep = la_4$y_new , 
+                     stat = sd ,
+                     binwidth = 1)
+
+bayesplot::ppc_stat( y = dil_dat$npositive , 
+                     yrep = la_4$y_new , 
+                     stat = min ,
+                     binwidth = 1)
+
+bayesplot::ppc_stat( y = dil_dat$npositive , 
+                     yrep = la_4$y_new , 
+                     stat = max ,
+                     binwidth = 10)
+```
+
+
+
+#### Compare replicated k to observed k
+
+```{r posterior_predictive_plots_4_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = log(dil_dat$npositive), yrep = log(la_4$y_new))
+```
+
+# Varying slopes and intercepts for conc groups
+
+```{stan bin_dilution_model_pp_g_o, echo=TRUE, message=FALSE, warning=FALSE, output.var="Bin_dilution_pp_g_slopes"}
+data{
+ int<lower=1> N;  // number of observations
+ int<lower=1> U; //number unique standard concentrations
+ int<lower=0> y[N];  // n success
+ int<lower=1> k[N];  // k trials
+ vector[N] x1;  // covariate vector
+ vector[U] x1_u;
+ vector<lower=0>[N] vol_c; // volume of chamber (mL) for conc. in gen. quant.k
+ int<lower=1 , upper=U> group[N]; // Grouping for estimates at U unique standard concns
+ }
+
+parameters{
+ real a0;  // pop-level mean of success (cloglog)
+ real b1;  // pop-level covariate slope
+ matrix[2, U] z_gamma;
+ vector<lower=0> [2] sigma_g;
+ cholesky_factor_corr [2] L_Omega_g;
+ }
+
+transformed parameters{
+ matrix[2, U] gamma = diag_pre_multiply(sigma_g, L_Omega_g) * z_gamma;
+ }
+
+model{
+ //priors
+ target += normal_lpdf(a0 | 0, 5);
+ target += normal_lpdf(b1 | 0, 2.5);
+ target += normal_lpdf(sigma_g | 0, 1.5);
+ target+= normal_lpdf(to_vector(z_gamma) | 0, 1);
+ 
+ //likelihood
+ for(n in 1:N)
+  target += binomial_lpmf(y[n] | k[n], inv_cloglog(log(vol_c[n]) + a0 + (b1 + gamma[2, group[n]]) * x1[n] + gamma[1, group[n]]));
+ }
+
+generated quantities{
+ int y_new[N];
+ real log_lik[N];
+ real lambda_mean_est[U];
+ real lambda_new[U];
+ 
+ for(u in 1:U){
+  lambda_mean_est[u] = exp(a0 + b1 * x1_u[u]);
+  lambda_new[u] = exp(a0 + (b1 + normal_rng(0, sigma_g[2]) * x1_u[u] + normal_rng(0, sigma_g[1])));
+  }
+  
+ for(i in 1:N){
+  y_new[i] = binomial_rng(k[i], inv_cloglog(log(vol_c[i]) + a0 + (b1 + normal_rng(0, sigma_g[2])) * x1[i] + normal_rng(0, sigma_g[1])));
+  log_lik[i] = binomial_lpmf(y[i] | k[i], inv_cloglog(log(vol_c[i]) + a0 + (b1 + gamma[2, group[i]]) * x1[i] + gamma[1, group[i]]));
+  }
+ }
+```
+
+### Fitting the varying intercepts and slopes model to our data
+
+The data list for Stan:
+```{r stan_data_pp_g_o_5, echo=TRUE, message=FALSE, warning=FALSE}
+stan_dataList <- list(N = length(dil_dat$npositive),
+                      U = length(unique(dil_dat$conc)),
+                      y = dil_dat$npositive,
+                      k = dil_dat$ntotal,
+                      x1 = log(dil_dat$conc),
+                      x1_u = log(unique(dil_dat$conc)),
+                      group = c(1,1,1,1,1,1,1,1,1,1,
+                                 2,2,2,2,2,2,2,2,2,2,
+                                 3,3,3,3,3,3,3,3,3,3,
+                                 4,4,4,4,4,4,4,4,4,4,
+                                 5,5,5,5,5,5,5,5,5,5,
+                                 6,6,6,6,6,6,6,6,6,6),
+                      vol_c = rep((0.91/1000), nrow(dil_dat))
+                      )
+```
+
+We fit the model:
+```{r fit_stan_model_pp_g_o_5, echo=TRUE, cache=TRUE}
+fit_5 <- sampling(object = Bin_dilution_pp_g_slopes,
+                  data = stan_dataList,
+                  chains = 4,
+                  iter = 3000,
+                  cores = 4,
+                  thin = 1,
+                  control = list(adapt_delta = 0.95, max_treedepth = 12),
+                  seed = 1235
+                  )
+```
+
+Lets look at a pairs plot to assess sampling.
+
+```{r pairs_fit_pp_g_o_5, echo=TRUE, warning=FALSE, message=FALSE, fig.asp=1, fig.width=6, fig.align='center'}
+pairs(fit_5,
+      pars=c(
+        "a0",
+        "b1",
+        "sigma_g",
+        "lp__"
+        ))
+
+```
+
+### Perform LOO
+
+```{r loo_model_5, warning=FALSE, message=FALSE, echo=TRUE}
+log_lik_5 <- loo::extract_log_lik(fit_5, parameter_name= "log_lik", merge_chains = FALSE)
+reff_5 <- loo::relative_eff(exp(log_lik_5),  cores=1)
+loo_5 <- loo::loo(log_lik_5, r_eff = reff_5, cores = 1, save_psis = TRUE)
+print(loo_5)
+plot(loo_5)
+
+#compare original model to partial pooling
+loo::compare(loo_1, loo_2 , loo_3, loo_4, loo_5)
+```
+
+#### LOO-PIT calibration
+Now lets use the loo calculations to graphically assess calibration. 
+
+First, we'll need to also extract the posteriors from our model fit and the weights from the LOO PSIS object.
+
+```{r extract_model_5}
+la_5 <- extract(fit_5)
+wts_5 <- weights(loo_5$psis_object)
+```
+
+Now we can plot the LOO-PIT overlay.
+```{r loo_pit_model_5, warning=FALSE, fig.align='center', fig.width=6, fig.asp=0.7}
+ppc_loo_pit_overlay(y = dil_dat$npositive, 
+                    yrep = la_5$y_new,
+                    lw = wts_5,
+                    samples = 50)
+```
+
+
+### Print and compare parameter summaries
+
+#### $\beta$ parameters
+```{r summary_beta_pp_g_o_5, echo=TRUE, message=FALSE, warning=FALSE, message=FALSE, paged.print=FALSE}
+print(fit_5,
+      pars=c(
+        "a0",
+        "b1",
+        "sigma_g",
+        "lp__"
+      ),
+      digits=4)
+
+print(beta.out) #compare to MLE
+```
+
+#### $\lambda$ parameter
+```{r summary_lambda_pp_g_o_5, echo=TRUE, message=FALSE, warning=FALSE, essage=FALSE, paged.print=FALSE}
+print(fit_5,
+      pars="lambda_mean_est",
+      digits=4)
+
+print(fit_5,
+      pars="lambda_new",
+      digits=4)
+
+lambda.out # compare to MLE
+```
+
+### PP Checks
+
+#### Interval coverages for observations
+```{r check_coverage_pp_g_o_5, fig.align='center', fig.asp=0.75, fig.width=6}
+bayesplot::ppc_dens_overlay(y = log(dil_dat$npositive),
+                            yrep = log(la_5$y_new[sample(1:2000, 50), ]))
+```
+
+#### Replicated min, mean, max, sd
+
+```{r replicated_checks_pp_g_o_5, fig.align='center', fig.asp=0.75, fig.width=4}
+bayesplot::ppc_stat( y = dil_dat$npositive , 
+                     yrep = la_5$y_new , 
+                     stat = mean ,
+                     binwidth = 1)
+
+bayesplot::ppc_stat( y = dil_dat$npositive , 
+                     yrep = la_5$y_new , 
+                     stat = sd ,
+                     binwidth = 1)
+
+bayesplot::ppc_stat( y = dil_dat$npositive , 
+                     yrep = la_5$y_new , 
+                     stat = min ,
+                     binwidth = 1)
+
+bayesplot::ppc_stat( y = dil_dat$npositive , 
+                     yrep = la_5$y_new , 
+                     stat = max ,
+                     binwidth = 10)
+```
+
+
+
+#### Compare replicated k to observed k
+
+```{r posterior_predictive_plots_4_1, echo=FALSE, fig.align="center", fig.asp=0.75, fig.width=8, message=FALSE, warning=FALSE}
+bayesplot::ppc_intervals(y = log(dil_dat$npositive), yrep = log(la_5$y_new))
+```
+
+
+# References
+
+
+
+
+
